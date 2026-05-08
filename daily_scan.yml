@@ -1,0 +1,48 @@
+name: A股蜡烛图每日扫描
+
+on:
+  # 定时触发：周一到周五，A 股收盘后 16:30（北京时间 = UTC+8，对应 UTC 08:30）
+  schedule:
+    - cron: "30 8 * * 1-5"
+
+  # 也可以手动在 GitHub Actions 页面点击运行
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60      # 全市场扫描最多跑 60 分钟
+
+    steps:
+      # 1. 拉取代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 设置 Python 环境
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: pip install akshare yfinance pandas openpyxl rich gspread google-auth
+
+      # 4. 写入 Google 服务账号密钥（从 GitHub Secrets 注入）
+      - name: Write service account key
+        run: echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > service_account.json
+
+      # 5. 跑扫描 + 写入 Sheets
+      - name: Run scan
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: python run_scan.py
+
+      # 6. 上传 Excel 作为 Artifact（可选，方便下载留档）
+      - name: Upload Excel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-result-${{ github.run_id }}
+          path: "*.xlsx"
+          retention-days: 7

@@ -1,0 +1,7 @@
+akshare
+yfinance
+pandas
+openpyxl
+rich
+gspread
+google-auth
