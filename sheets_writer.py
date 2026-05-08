@@ -53,20 +53,17 @@ def write_to_sheet(df: pd.DataFrame,
     gc     = connect(key_file)
     book   = gc.open_by_key(spreadsheet_id)
     now    = datetime.now().strftime("%Y-%m-%d %H:%M")
-    cols   = list(df.columns)
 
     # ── 写全部结果 ──────────────────────────────────
     _write_tab(book, "📊 全部扫描结果", df, now)
 
     # ── 写买入观察 ──────────────────────────────────
     buy_df = df[df["信号"] == "🟢 买入观察"].copy()
-    if not buy_df.empty:
-        _write_tab(book, "🟢 买入观察", buy_df, now)
+    _write_tab(book, "🟢 买入观察", buy_df, now)
 
     # ── 写关注候选 ──────────────────────────────────
     watch_df = df[df["信号"] == "🟡 关注候选"].copy()
-    if not watch_df.empty:
-        _write_tab(book, "🟡 关注候选", watch_df, now)
+    _write_tab(book, "🟡 关注候选", watch_df, now)
 
     print(f"✅ 已写入 Google Sheets（{now}）")
     print(f"   全部：{len(df)} 只 · 买入观察：{len(buy_df)} 只 · 关注候选：{len(watch_df)} 只")
@@ -79,7 +76,7 @@ def _write_tab(book, tab_name: str, df: pd.DataFrame, timestamp: str):
         ws = book.worksheet(tab_name)
         ws.clear()
     except gspread.WorksheetNotFound:
-        ws = book.add_worksheet(title=tab_name, rows=len(df)+5, cols=len(df.columns))
+        ws = book.add_worksheet(title=tab_name, rows=max(len(df) + 5, 10), cols=max(len(df.columns), 1))
 
     cols     = list(df.columns)
     n_cols   = len(cols)
@@ -102,6 +99,11 @@ def _write_tab(book, tab_name: str, df: pd.DataFrame, timestamp: str):
     # ── 批量格式化（用 batchUpdate 一次搞定）──────────
     sheet_id  = ws._properties["sheetId"]
     requests  = []
+
+    # 先解除旧的摘要行合并，避免重复运行时 mergeCells 撞上已有合并区域
+    requests.append({"unmergeCells": {
+        "range": _rng(sheet_id, 0, 0, 1, n_cols)
+    }})
 
     # 1. 合并第一行（摘要行跨列）
     requests.append({"mergeCells": {
@@ -142,7 +144,6 @@ def _write_tab(book, tab_name: str, df: pd.DataFrame, timestamp: str):
     }})
 
     # 5. 数据行按信号着色
-    sig_col_idx = cols.index("信号") if "信号" in cols else -1
     for ri, (_, row) in enumerate(df.iterrows()):
         data_row = ri + 2   # 0-indexed: 行0=摘要, 行1=标题, 行2+=数据
         sig = str(row.get("信号", ""))
@@ -158,11 +159,12 @@ def _write_tab(book, tab_name: str, df: pd.DataFrame, timestamp: str):
         }})
 
     # 6. 自动筛选（从标题行开始）
-    requests.append({"setBasicFilter": {
-        "filter": {
-            "range": _rng(sheet_id, 1, 0, n_rows+2, n_cols)
-        }
-    }})
+    if n_rows > 0:
+        requests.append({"setBasicFilter": {
+            "filter": {
+                "range": _rng(sheet_id, 1, 0, n_rows+2, n_cols)
+            }
+        }})
 
     # 7. 列宽
     widths = {"代码":80,"名称":100,"信号":120,"当前价":80,"趋势评分":80,

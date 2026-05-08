@@ -25,8 +25,7 @@ def main():
     # 2. 并发扫描（GitHub Actions 机器约 2 核，workers 不宜太高）
     result_df = run_full_scan(universe, period="6mo", workers=10)
     if result_df.empty:
-        print("❌ 扫描无结果")
-        return
+        print("⚠️  扫描无结果，将写入空结果以清理旧数据")
 
     # 3. 保存 Excel（上传为 Artifact）
     ts = datetime.now().strftime("%Y%m%d_%H%M")
