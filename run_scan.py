@@ -23,7 +23,8 @@ def main():
         return
 
     # 2. 并发扫描（GitHub Actions 机器约 2 核，workers 不宜太高）
-    result_df = run_full_scan(universe, period="6mo", workers=10)
+    # 使用 1y 数据确保 MA120/MA200 有足够历史
+    result_df = run_full_scan(universe, period="1y", workers=10)
     if result_df.empty:
         print("⚠️  扫描无结果，将写入空结果以清理旧数据")
 
