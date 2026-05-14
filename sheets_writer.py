@@ -65,8 +65,13 @@ def write_to_sheet(df: pd.DataFrame,
     watch_df = df[df["信号"] == "🟡 关注候选"].copy()
     _write_tab(book, "🟡 关注候选", watch_df, now)
 
+    # ── 写卖出/止盈 ─────────────────────────────────
+    sell_df = df[df["信号"] == "🔴 卖出/止盈"].copy()
+    _write_tab(book, "🔴 卖出止盈", sell_df, now)
+
     print(f"✅ 已写入 Google Sheets（{now}）")
-    print(f"   全部：{len(df)} 只 · 买入观察：{len(buy_df)} 只 · 关注候选：{len(watch_df)} 只")
+    print(f"   全部：{len(df)} 只 · 买入观察：{len(buy_df)} 只 · "
+          f"关注候选：{len(watch_df)} 只 · 卖出止盈：{len(sell_df)} 只")
 
 
 def _write_tab(book, tab_name: str, df: pd.DataFrame, timestamp: str):
@@ -167,9 +172,16 @@ def _write_tab(book, tab_name: str, df: pd.DataFrame, timestamp: str):
         }})
 
     # 7. 列宽
-    widths = {"代码":80,"名称":100,"信号":120,"当前价":80,"趋势评分":80,
-              "风险收益比":90,"①激进买入":95,"②回调买入":95,"③突破买入":95,
-              "止损价":80,"目标价":80,"ATR":70,"主要形态":160,"扫描时间":140}
+    widths = {
+        "代码": 80, "名称": 100, "信号": 130, "当前价": 80,
+        "趋势类型": 100, "趋势评分": 80,
+        "买入形态": 180, "卖出形态": 180, "关键位置": 140, "窗口状态": 200,
+        "①激进买入": 95, "②回调买入": 95, "③突破买入": 95,
+        "止损价": 80, "止损距离%": 80, "目标价": 80, "目标空间%": 80,
+        "风险收益比": 90, "ATR": 70, "扫描时间": 140,
+        # 兼容旧列名
+        "趋势评分": 80, "主要形态": 160,
+    }
     for ci, col in enumerate(cols):
         px = widths.get(col, 90)
         requests.append({"updateDimensionProperties": {
