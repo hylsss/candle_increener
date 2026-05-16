@@ -15,6 +15,7 @@ from datetime import datetime
 import local_patch  # noqa: F401  把东财接口劫持到新浪源（本机 + Actions 都必须）
 from full_scan import get_universe, run_full_scan, save_excel, pick_strategies
 from sheets_writer import write_to_sheet
+from notifier import push_picks
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 KEY_FILE       = "service_account.json"
@@ -57,6 +58,9 @@ def main():
         write_to_sheet(result_df, SPREADSHEET_ID, picks=picks, key_file=KEY_FILE)
     else:
         print("⚠️  未设置 SPREADSHEET_ID，跳过写入 Sheets")
+
+    # 6. 微信推送（PushPlus），无 token 时 no-op
+    push_picks(picks, top_n=8)
 
     print("=== 扫描完成 ===")
 

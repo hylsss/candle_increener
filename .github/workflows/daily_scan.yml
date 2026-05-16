@@ -33,10 +33,11 @@ jobs:
       - name: Write service account key
         run: echo '${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}' > service_account.json
 
-      # 5. 跑扫描 + 写入 Sheets
+      # 5. 跑扫描 + 写入 Sheets + 微信推送
       - name: Run scan
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python run_scan.py
 
       # 6. 上传 Excel 作为 Artifact（可选，方便下载留档）
