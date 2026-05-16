@@ -12,6 +12,7 @@ analyze_one.py
 import argparse
 import sys
 
+import local_patch  # noqa: F401  bypass blocked eastmoney code-list endpoint
 import akshare as ak
 import pandas as pd
 
@@ -67,6 +68,13 @@ def _print_report(result, hist):
     print(f"  ①激进买入 : {result['①激进买入']}  （当前价直接介入）")
     print(f"  ②回调买入 : {result['②回调买入']}  （等回踩 MA20）")
     print(f"  ③突破买入 : {result['③突破买入']}  （站稳近 20 日高点）")
+    print()
+
+    print("  ── 📈 未触发买点（预测） ─────────────────────")
+    print(f"  🚀 突破触发价 : {result['🚀突破触发价']}")
+    print(f"  📍 均线触发价 : {result['📍均线触发价']}")
+    print(f"  🌅 抄底关注价 : {result['🌅抄底关注价']}")
+    print(f"  触发条件      : {result['触发条件']}")
     print()
 
     print("  ── 风险控制 ──────────────────────────────────")

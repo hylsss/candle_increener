@@ -18,20 +18,29 @@ OUTPUT_COLUMNS = [
     "当前价", "趋势类型", "趋势评分",
     "买入形态", "卖出形态", "关键位置", "窗口状态",
     "①激进买入", "②回调买入", "③突破买入",
+    "🚀突破触发价", "📍均线触发价", "🌅抄底关注价", "触发条件",
     "止损价", "止损距离%", "目标价", "目标空间%", "风险收益比",
     "ATR", "扫描时间",
 ]
 
 
-def get_universe(min_price=3.0, max_price=500.0, min_turnover=0.3):
-    """获取 A 股股票池，过滤 ST 和极低流动性标的"""
-    spot = ak.stock_zh_a_spot_em()
+def get_universe(min_price=3.0, max_price=500.0, min_turnover=0.3,
+                 main_board_only=True):
+    """
+    获取 A 股股票池。用新浪源（本机东财不可达）。
+    main_board_only=True 时只保留沪深主板（剔除 300/301 创业板、688 科创板、
+    8xx/4xx 北交所、9xx B 股）。同时过滤 ST 和极低流动性标的。
+    """
+    spot = ak.stock_zh_a_spot()
     required = {"代码", "名称", "最新价", "成交额"}
     missing = required - set(spot.columns)
     if missing:
         raise ValueError(f"行情字段缺失：{', '.join(sorted(missing))}")
 
     df = spot.copy()
+    # 新浪源代码自带交易所前缀（sh600519 / sz000001 / bj920000），剥成纯 6 位
+    df["代码"] = df["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
+
     df["当前价"] = pd.to_numeric(df["最新价"], errors="coerce")
     df["成交额_亿元"] = pd.to_numeric(df["成交额"], errors="coerce") / 100_000_000
 
@@ -40,6 +49,11 @@ def get_universe(min_price=3.0, max_price=500.0, min_turnover=0.3):
         & (df["成交额_亿元"] >= min_turnover)
         & ~df["名称"].astype(str).str.contains("ST", case=False, na=False)
     )
+
+    if main_board_only:
+        # 保留：60x（沪主板）、00x（深主板/中小板）。其它一律剔除。
+        mask &= df["代码"].str.match(r"^(60[0135]|00[0123])")
+
     return df.loc[mask, ["代码", "名称", "当前价", "成交额_亿元"]].reset_index(drop=True)
 
 
@@ -79,10 +93,94 @@ def run_full_scan(universe, period="1y", workers=10):
     return df.drop(columns="_rank").reset_index(drop=True)
 
 
-def save_excel(df, path):
-    """保存扫描结果到 Excel"""
-    df.to_excel(path, index=False)
-    print(f"✅ Excel 已保存：{path}")
+STRATEGY_NAMES = {
+    "breakout": "🚀 突破追涨",
+    "pullback": "🔄 强势回踩",
+    "reversal": "🌅 底部反转",
+    "high_rr":  "📈 高RR精选",
+}
+
+
+def pick_strategies(df, max_per_strategy=30):
+    """
+    按 4 个策略从扫描结果里选股。返回 dict[策略名 -> DataFrame]。
+
+    🚀 突破追涨：当前价距 🚀突破触发价 ≤ 3% + 趋势 ≥ 60
+    🔄 强势回踩：上升趋势 ≥ 65 + 当前价距 MA20 ≤ 3% + 出现下影线/吞噬类买入信号
+    🌅 底部反转：趋势=底部转强 + 出现 启明星/锤子/看涨吞噬/刺穿 之一
+    📈 高RR精选：信号=🟢 买入观察 + R:R ≥ 2.5 + 趋势 ≥ 60
+    """
+    empty = df.iloc[:0].copy()
+    if df.empty:
+        return {n: empty for n in STRATEGY_NAMES.values()}
+
+    d = df.copy()
+    d["_price"] = pd.to_numeric(d["当前价"], errors="coerce")
+    d["_trend"] = pd.to_numeric(d["趋势评分"], errors="coerce")
+    d["_rr"]    = pd.to_numeric(d["风险收益比"], errors="coerce")
+    d["_bo"]    = pd.to_numeric(d["🚀突破触发价"], errors="coerce")
+    d["_ma"]    = pd.to_numeric(d["📍均线触发价"], errors="coerce")
+    d["_buy"]   = d["买入形态"].fillna("")
+
+    drop_aux = ["_price", "_trend", "_rr", "_bo", "_ma", "_buy", "距触发%", "距MA20%"]
+
+    # 🚀 突破追涨（只要 🟢 买入观察）
+    bo_gap = (d["_bo"] - d["_price"]) / d["_price"]
+    bo = d[(d["信号"] == "🟢 买入观察")
+           & (d["_bo"] > 0) & (bo_gap <= 0.03) & (bo_gap >= -0.005)
+           & (d["_trend"] >= 60)].copy()
+    if not bo.empty:
+        bo["距触发%"] = ((bo["_bo"] - bo["_price"]) / bo["_price"] * 100).round(2)
+        bo = bo.sort_values(["距触发%", "_trend"], ascending=[True, False])
+
+    # 🔄 强势回踩
+    pb_pats = ("锤子线", "看涨吞噬", "十字星确认", "启明星", "刺穿形态", "倒锤子")
+    pb_mask = d["_buy"].apply(lambda s: any(p in s for p in pb_pats))
+    ma_gap = (d["_price"] - d["_ma"]).abs() / d["_ma"]
+    pb = d[(d["趋势类型"] == "上升趋势") & (d["_trend"] >= 65)
+           & (d["_ma"] > 0) & (ma_gap <= 0.03) & pb_mask].copy()
+    if not pb.empty:
+        pb["距MA20%"] = ((pb["_price"] - pb["_ma"]) / pb["_ma"] * 100).round(2)
+        pb = pb.sort_values(["_trend", "_rr"], ascending=[False, False])
+
+    # 🌅 底部反转（趋势 ≥ 50 + 至少 🟡 关注候选，排除 ⚪ 弱信号诱多）
+    rv_pats = ("启明星", "锤子线", "看涨吞噬", "倒锤子", "刺穿形态")
+    rv_mask = d["_buy"].apply(lambda s: any(p in s for p in rv_pats))
+    rv = d[(d["趋势类型"] == "底部转强") & (d["_trend"] >= 50)
+           & (d["信号"] != "⚪ 无明显信号") & rv_mask].copy()
+    if not rv.empty:
+        rv = rv.sort_values(["_rr", "_trend"], ascending=[False, False])
+
+    # 📈 高 RR 精选
+    hr = d[(d["信号"] == "🟢 买入观察") & (d["_rr"] >= 2.5) & (d["_trend"] >= 60)].copy()
+    if not hr.empty:
+        hr = hr.sort_values("_rr", ascending=False)
+
+    def _clean(picked):
+        return picked.head(max_per_strategy).drop(
+            columns=[c for c in drop_aux if c in picked.columns],
+            errors="ignore",
+        ).reset_index(drop=True)
+
+    return {
+        STRATEGY_NAMES["breakout"]: _clean(bo),
+        STRATEGY_NAMES["pullback"]: _clean(pb),
+        STRATEGY_NAMES["reversal"]: _clean(rv),
+        STRATEGY_NAMES["high_rr"]:  _clean(hr),
+    }
+
+
+def save_excel(df, path, picks=None):
+    """保存扫描结果到 Excel：主表 + 各策略 sheet"""
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="📊 全部扫描结果"[:31], index=False)
+        if picks:
+            for name, pick_df in picks.items():
+                pick_df.to_excel(writer, sheet_name=name[:31], index=False)
+    print(f"✅ Excel 已保存：{path}（{len(df)} 只主表）")
+    if picks:
+        for name, pick_df in picks.items():
+            print(f"   {name}: {len(pick_df)} 只")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -117,8 +215,10 @@ def _scan_one(stock, period):
 
     ma20    = float(last["MA20"])
     high20  = float(hist["最高"].tail(20).max())
-    pullback_buy = min(ma20, close)
+    pullback_buy = ma20 if close > ma20 else None    # 跌破 MA20 时回调买入无意义
     breakout_buy = high20
+
+    triggers = _predict_buy_triggers(close, hist, last, atr, trend_type)
 
     signal = _determine_signal(
         trend_type, trend_score, rr, buy_patterns, sell_patterns, close, last
@@ -136,8 +236,12 @@ def _scan_one(stock, period):
         "关键位置":  "、".join(key_levels)    if key_levels    else "无",
         "窗口状态":  window_status,
         "①激进买入": _round(close),
-        "②回调买入": _round(pullback_buy),
+        "②回调买入": _round(pullback_buy) if pullback_buy is not None else "—",
         "③突破买入": _round(breakout_buy),
+        "🚀突破触发价": triggers["breakout_price"],
+        "📍均线触发价": triggers["ma_price"],
+        "🌅抄底关注价": triggers["bottom_price"],
+        "触发条件":  triggers["desc"],
         "止损价":    _round(stop),
         "止损距离%": _round((close - stop) / close * 100),
         "目标价":    _round(target),
@@ -492,6 +596,64 @@ def _detect_windows(hist):
     return "无明显缺口"
 
 
+def _find_unfilled_down_window_top(hist):
+    """最近一个未填补的下降窗口的上沿价（前一根的最低价）；无则 None。"""
+    if len(hist) < 5:
+        return None
+    close  = float(hist.iloc[-1]["收盘"])
+    recent = hist.tail(20)
+    n      = len(recent)
+    for i in range(n - 1, 0, -1):
+        p_hi = float(recent.iloc[i - 1]["最高"])
+        p_lo = float(recent.iloc[i - 1]["最低"])
+        c_lo = float(recent.iloc[i]["最低"])
+        c_hi = float(recent.iloc[i]["最高"])
+        if c_lo > p_hi:               # 最近的是向上窗口，无下降窗口需追踪
+            return None
+        if c_hi < p_lo and close < p_lo:    # 未填补的下降窗口
+            return p_lo
+    return None
+
+
+# ── 预测买点：把形态成立条件反推成触发阈值 ────────────────────────
+def _predict_buy_triggers(close, hist, last, atr, trend_type):
+    """
+    输出三类前瞻触发价 + 一行文字说明：
+      - 🚀 突破触发价：max(20日高, 未填补下降窗口上沿)，收盘站上 + 放量 1.3×
+      - 📍 均线触发价：MA20 — 上升趋势=回踩不破，下跌趋势=收盘站上
+      - 🌅 抄底关注价：仅下跌/底部转强且贴近 30 日低点时给出
+    """
+    ma20  = float(last["MA20"])
+    high20 = float(hist["最高"].tail(20).max())
+    low30  = float(hist["最低"].tail(30).min()) if len(hist) >= 30 else float(hist["最低"].min())
+
+    gap_top  = _find_unfilled_down_window_top(hist)
+    breakout = max(high20, gap_top) if gap_top else high20
+
+    show_bottom  = trend_type in ("下跌趋势", "底部转强") and close <= low30 * 1.08
+    bottom_price = _round(low30) if show_bottom else "—"
+
+    parts = []
+    if close < breakout * 0.999:
+        gap_note = f"（含窗口上沿 {_round(gap_top)}）" if gap_top and gap_top < high20 else ""
+        parts.append(f"🚀 收盘≥{_round(breakout)} + 量>1.3×VOL20 → 突破{gap_note}")
+
+    if close > ma20:
+        parts.append(f"📍 回踩{_round(ma20)}不破 → 趋势延续")
+    else:
+        parts.append(f"📍 收盘≥{_round(ma20)} → 站上MA20反转")
+
+    if show_bottom:
+        parts.append(f"🌅 触{_round(low30)}后反弹收阳 → 锤子/启明星抄底")
+
+    return {
+        "breakout_price": _round(breakout),
+        "ma_price":       _round(ma20),
+        "bottom_price":   bottom_price,
+        "desc":           " | ".join(parts) if parts else "—",
+    }
+
+
 # ── 止损与目标 ────────────────────────────────────────────────────────
 
 def _calc_stop_target(close, atr, hist, buy_patterns):
@@ -553,13 +715,14 @@ def _determine_signal(trend_type, trend_score, rr, buy_p, sell_p, close, last):
     strong_buy  = any(p in buy_p  for p in ["看涨吞噬", "启明星", "放量突破", "三白兵", "长白实体"])
     strong_sell = any(p in sell_p for p in ["看跌吞噬", "黄昏星", "乌云盖顶", "三黑鸦"])
 
-    # 卖出优先
+    # 卖出优先：只有出现真实卖出形态 + 弱势才标红
     if strong_sell and trend_type in ("横盘震荡", "下跌趋势"):
         return "🔴 卖出/止盈"
     if sell_p and trend_type == "下跌趋势":
         return "🔴 卖出/止盈"
+    # 趋势弱 + 无买点 → "无信号"（而不是"该卖"），避免把酝酿反转的底部票误判
     if close < ma60 and not buy_p:
-        return "🔴 卖出/止盈"
+        return "⚪ 无明显信号"
 
     # 买入
     if trend_type in ("上升趋势", "强势回调", "底部转强"):

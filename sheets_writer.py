@@ -40,38 +40,41 @@ def connect(key_file: str = "service_account.json"):
 
 def write_to_sheet(df: pd.DataFrame,
                    spreadsheet_id: str,
+                   picks: dict = None,
                    key_file: str = "service_account.json"):
     """
     把扫描结果写入指定 Google Sheets。
-    - 第一个 Sheet "扫描结果" 写全部数据
-    - 第二个 Sheet "买入观察" 只写买入标的
-    - 在 A1 写入本次扫描时间和统计
+    - 📊 全部扫描结果
+    - 🟢 买入观察 / 🟡 关注候选 / 🔴 卖出止盈 （按信号分组）
+    - 4 个策略 tab（若传入 picks）
 
     spreadsheet_id: 从 Sheets URL 里取，
       https://docs.google.com/spreadsheets/d/【这里】/edit
+    picks: full_scan.pick_strategies 的返回值
     """
     gc     = connect(key_file)
     book   = gc.open_by_key(spreadsheet_id)
     now    = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # ── 写全部结果 ──────────────────────────────────
     _write_tab(book, "📊 全部扫描结果", df, now)
 
-    # ── 写买入观察 ──────────────────────────────────
-    buy_df = df[df["信号"] == "🟢 买入观察"].copy()
-    _write_tab(book, "🟢 买入观察", buy_df, now)
-
-    # ── 写关注候选 ──────────────────────────────────
+    buy_df   = df[df["信号"] == "🟢 买入观察"].copy()
     watch_df = df[df["信号"] == "🟡 关注候选"].copy()
+    sell_df  = df[df["信号"] == "🔴 卖出/止盈"].copy()
+    _write_tab(book, "🟢 买入观察", buy_df, now)
     _write_tab(book, "🟡 关注候选", watch_df, now)
-
-    # ── 写卖出/止盈 ─────────────────────────────────
-    sell_df = df[df["信号"] == "🔴 卖出/止盈"].copy()
     _write_tab(book, "🔴 卖出止盈", sell_df, now)
+
+    if picks:
+        for name, pick_df in picks.items():
+            _write_tab(book, name, pick_df, now)
 
     print(f"✅ 已写入 Google Sheets（{now}）")
     print(f"   全部：{len(df)} 只 · 买入观察：{len(buy_df)} 只 · "
           f"关注候选：{len(watch_df)} 只 · 卖出止盈：{len(sell_df)} 只")
+    if picks:
+        for name, pick_df in picks.items():
+            print(f"   {name}: {len(pick_df)} 只")
 
 
 def _write_tab(book, tab_name: str, df: pd.DataFrame, timestamp: str):
