@@ -1,17 +1,13 @@
 """
 local_patch.py
 ────────────────────────────────────
-本地运行补丁：东方财富的 push2his 接口在本机网络下
-被服务端断开 SSL（curl 也复现），把项目里用到的取 K 线
-函数改走新浪源：
+东方财富的 push2his 接口在本机网络 + GitHub Actions runner（Azure IP）
+下都被服务端断开/拒连，把取 K 线函数改走新浪源：
 
   ak.stock_zh_a_hist → ak.stock_zh_a_daily   (sina)
 
-在 GitHub Actions 环境下（GITHUB_ACTIONS=true），东财正常，
-patch 自动跳过，保持原生性能。
+经验证：本机 + Actions 都用 sina 才能稳定跑通；东财在两边都不可用。
 """
-
-import os
 
 import akshare as ak
 import pandas as pd
@@ -59,5 +55,4 @@ def _stock_zh_a_hist_via_sina(symbol, period="daily", start_date="19700101",
     return out.reset_index(drop=True)
 
 
-if os.environ.get("GITHUB_ACTIONS") != "true":
-    ak.stock_zh_a_hist = _stock_zh_a_hist_via_sina
+ak.stock_zh_a_hist = _stock_zh_a_hist_via_sina

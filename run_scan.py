@@ -9,9 +9,10 @@ run_scan.py  ── GitHub Actions 入口
 """
 
 import os
+import sys
 from datetime import datetime
 
-import local_patch  # noqa: F401  本地：把东财接口劫持到新浪源
+import local_patch  # noqa: F401  把东财接口劫持到新浪源（本机 + Actions 都必须）
 from full_scan import get_universe, run_full_scan, save_excel, pick_strategies
 from sheets_writer import write_to_sheet
 
@@ -38,11 +39,14 @@ def main():
     # 2. 并发扫描
     workers = int(os.environ.get("WORKERS", 10))
     result_df = run_full_scan(universe, period="1y", workers=workers)
+
+    # 全军覆没视为故障，避免写空 Sheets 覆盖旧数据
     if result_df.empty:
-        print("⚠️  扫描无结果，将写入空结果以清理旧数据")
+        print(f"❌ 全部 {len(universe)} 只票扫描失败，数据源不可达，本次不写 Sheets")
+        sys.exit(1)
 
     # 3. 4 策略选股
-    picks = pick_strategies(result_df) if not result_df.empty else None
+    picks = pick_strategies(result_df)
 
     # 4. 保存 Excel（多 sheet：主表 + 4 策略）
     ts = datetime.now().strftime("%Y%m%d_%H%M")
