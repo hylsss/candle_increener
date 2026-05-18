@@ -16,7 +16,7 @@ import akshare as ak
 
 from chanlun_core import (
     Direction, FractalType,
-    from_dataframe, merge_klines, find_fractals, find_strokes,
+    from_dataframe, merge_klines, find_fractals, find_strokes, find_segments,
 )
 
 
@@ -76,6 +76,21 @@ def main(code: str = "600519"):
             print(f"    {arrow} {s.start_fx.dt} {s.start_price:.2f}"
                   f" → {s.end_fx.dt} {s.end_price:.2f}"
                   f"（振幅 {abs(s.end_price - s.start_price):.2f}）")
+
+    # 线段：基于"新笔"序列做划分
+    print()
+    strokes_new = find_strokes(merged, fxs, new_stroke=True)
+    segments = find_segments(strokes_new)
+    seg_ups = sum(1 for s in segments if s.direction == Direction.UP)
+    seg_downs = sum(1 for s in segments if s.direction == Direction.DOWN)
+    confirmed = sum(1 for s in segments if s.break_type != 0)
+    print(f"  线段 {len(segments)}（上 {seg_ups} / 下 {seg_downs}，已确认破坏 {confirmed}）")
+    for seg in segments[-5:]:
+        arrow = "↑" if seg.direction == Direction.UP else "↓"
+        bt = {0: "未完成", 1: "第一种破坏", 2: "第二种破坏"}.get(seg.break_type, "?")
+        print(f"    {arrow} {seg.start_fx.dt} {seg.start_price:.2f}"
+              f" → {seg.end_fx.dt} {seg.end_price:.2f}"
+              f"（{len(seg)}笔，{bt}）")
 
 
 if __name__ == "__main__":

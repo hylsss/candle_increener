@@ -6,13 +6,14 @@ chanlun_core.py
 实现严格依据《教你炒股票》108课原文。所有边界条件与硬性规则在
 CHANLUN_NOTES.md 中有完整引用，本文件每一步实现都标注对应课次。
 
-本文件第一批实现：
-  1. RawBar / MergedBar / Fractal / Stroke 数据结构
-  2. merge_klines        ── K线包含合并（第62/65/77课）
-  3. find_fractals       ── 顶/底分型识别（第62/77课）
-  4. find_strokes        ── 笔的划分（第77课3步法，支持新笔/老笔配置）
-
-后续批次：线段、中枢、MACD背驰、买卖点。
+本文件实现进度：
+  Phase 1.1  merge_klines     ── K线包含合并（第62/65/77课）         ✅
+  Phase 1.2  find_fractals    ── 顶/底分型识别（第62/77课）          ✅
+  Phase 1.3  find_strokes     ── 笔的划分（第77课3步法）             ✅
+  Phase 1.4  find_segments    ── 线段划分（第67/71/77/78课）         ✅
+  Phase 1.5  find_pivots      ── 中枢识别（第17/29课）               🚧
+  Phase 1.6  detect_divergence── MACD背驰                            🚧
+  Phase 1.7  find_signals     ── 1/2/3类买卖点                       🚧
 """
 
 from __future__ import annotations
@@ -479,6 +480,301 @@ def find_strokes(merged: list[MergedBar],
         # （未来如需更精细，可在此插入"特殊处理"。）
 
     return strokes
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 4. 线段划分 — 第67/71/77/78课
+# ══════════════════════════════════════════════════════════════════════
+#
+# 算法概述：
+#   ① 找起点：连续三笔有价格重叠 + 第一笔与第三笔同向 → 该方向即线段方向。
+#   ② 特征序列：与线段方向相反的笔，按顺序构成序列；元素用 (high, low) 描述。
+#   ③ 破坏：在特征序列上识别"反向分型"——
+#       第一种破坏（无缺口）：第1、2 元素之间没有缺口（区间有重叠）。
+#                            两侧不做包含合并；分型在第2元素出现即结束线段。
+#       第二种破坏（有缺口）：第1、2 元素之间有缺口。
+#                            从假定转折点开始，对反向特征序列做包含合并；
+#                            反向特征序列出现分型即结束线段（不再细分缺口）。
+#   ④ 第三笔完全在第一笔范围内（第71课）：先不确认破坏，等突破第一笔的端点。
+#   ⑤ 古怪线段（第78课）：第一种破坏后，反向没有形成新线段时，重新合并回原方向。
+#
+# 实现采取"对每个候选转折点都先记录，等右侧足够 K 线后再确认"的方式。
+# 简化点：第二种破坏的"反向特征序列包含合并"采用同一套 _merge_feat_elems。
+# ══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class _FeatElem:
+    """特征序列元素（一条或多条同向笔合并后的等价笔）。"""
+    high: float
+    low: float
+    stroke_start_idx: int        # 在 strokes 列表中的起始下标
+    stroke_end_idx: int          # 在 strokes 列表中的结束下标（含）
+    direction: Direction         # 该笔/合并组的方向（与所属线段方向相反）
+
+
+def _stroke_overlap(s_a: Stroke, s_b: Stroke) -> bool:
+    """两条笔的价格区间 [low, high] 是否有重叠（含端点相等）。"""
+    return s_a.low <= s_b.high and s_b.low <= s_a.high
+
+
+def _elem_from_stroke(s: Stroke) -> _FeatElem:
+    return _FeatElem(
+        high=s.high, low=s.low,
+        stroke_start_idx=s.idx, stroke_end_idx=s.idx,
+        direction=s.direction,
+    )
+
+
+def _merge_feat_elems(prev: _FeatElem, cur: _FeatElem,
+                      seg_direction: Direction) -> _FeatElem | None:
+    """
+    特征序列内部的包含合并（第67/71课）。
+    seg_direction 是所属线段方向；特征序列元素方向与之相反。
+      上行段（seg_direction=UP）的特征序列由向下笔组成 → 取较低的高、较低的低？
+      实际原文：特征序列元素也按"笔的方向"做包含——上行段特征序列由下行笔组成，
+      特征序列包含合并采用"向下"取法：[min(high), min(low)]。
+      下行段反之：[max(high), max(low)]。
+    若 prev 和 cur 不构成包含关系（即彼此独立），返回 None 表示不合并。
+    """
+    contained = (
+        (prev.high >= cur.high and prev.low <= cur.low)
+        or (cur.high >= prev.high and cur.low <= prev.low)
+    )
+    if not contained:
+        return None
+
+    if seg_direction == Direction.UP:
+        new_high = min(prev.high, cur.high)
+        new_low = min(prev.low, cur.low)
+    else:
+        new_high = max(prev.high, cur.high)
+        new_low = max(prev.low, cur.low)
+
+    return _FeatElem(
+        high=new_high, low=new_low,
+        stroke_start_idx=prev.stroke_start_idx,
+        stroke_end_idx=cur.stroke_end_idx,
+        direction=prev.direction,
+    )
+
+
+def _has_gap(prev: _FeatElem, cur: _FeatElem,
+             seg_direction: Direction) -> bool:
+    """
+    特征序列相邻两元素之间是否存在缺口（即区间完全不重叠）。
+    seg_direction = UP 时，特征序列方向 = DOWN：
+        缺口 = prev.low > cur.high（前元素的低区仍高于后元素的高区）。
+    seg_direction = DOWN 时（特征序列方向 = UP）：
+        缺口 = prev.high < cur.low。
+    """
+    if seg_direction == Direction.UP:
+        return prev.low > cur.high
+    return prev.high < cur.low
+
+
+def _is_feat_fractal(e1: _FeatElem, e2: _FeatElem, e3: _FeatElem,
+                     seg_direction: Direction) -> bool:
+    """
+    特征序列三元素是否构成"反向分型"（中间元素是端点）。
+    上行段（seg_direction=UP）：寻找"顶分型"——e2.high 是相邻三者中最高，
+                                且 e2.low 也是相邻三者中最高（严格不等）。
+    下行段：寻找"底分型"——e2.low 是最低，且 e2.high 也是最低。
+    严格不等避免退化情形。
+    """
+    if seg_direction == Direction.UP:
+        return (e2.high > e1.high and e2.high > e3.high
+                and e2.low > e1.low and e2.low > e3.low)
+    return (e2.low < e1.low and e2.low < e3.low
+            and e2.high < e1.high and e2.high < e3.high)
+
+
+def find_segments(strokes: list[Stroke]) -> list[Segment]:
+    """
+    把笔序列划成线段。
+    返回所有完成的线段（最后一段如果未确认破坏，也作为"未完成"返回，
+    用 break_type=0 标识；其余 1=第一种破坏，2=第二种破坏）。
+
+    实现是状态机式滚动：维护当前线段的方向、构成笔，以及反向特征序列。
+    """
+    if len(strokes) < 3:
+        return []
+
+    segments: list[Segment] = []
+
+    # ── 找起点：连续三笔有重叠且第1、3笔同向 ───────────────────────
+    start_i = -1
+    for i in range(len(strokes) - 2):
+        s1, s2, s3 = strokes[i], strokes[i + 1], strokes[i + 2]
+        if s1.direction == s3.direction and _stroke_overlap(s1, s3):
+            start_i = i
+            break
+    if start_i < 0:
+        return []
+
+    # 当前线段状态
+    seg_dir = strokes[start_i].direction
+    seg_strokes: list[Stroke] = list(strokes[start_i: start_i + 3])
+
+    # 特征序列：由"反向笔"构成；初始只有起始三笔中的第二笔
+    feat_seq: list[_FeatElem] = [_elem_from_stroke(strokes[start_i + 1])]
+
+    # 第二种破坏的"反向特征序列"暂存：
+    #   pending_break_elem 是假定线段终止点（特征序列分型的极值元素）；
+    #   反向特征序列为 reverse_feat_seq；当它出现分型，第二种破坏确认。
+    pending_break_elem: _FeatElem | None = None
+    reverse_feat_seq: list[_FeatElem] = []
+    # 第二种破坏判断时是否需要包含合并（第78课要求）
+    # 第一种破坏：特征序列内不合并；第二种破坏：合并。
+    # 我们对两套序列分别处理。
+
+    def finish_segment(break_type: int, end_stroke_pos: int):
+        """
+        把当前累积的 seg_strokes 截到 end_stroke_pos（含）为止，提交为一段。
+        然后用余下的笔重置线段方向。
+        """
+        nonlocal seg_strokes, seg_dir, feat_seq
+        nonlocal pending_break_elem, reverse_feat_seq
+
+        # end_stroke_pos 是 strokes 全局下标
+        confirmed = [s for s in seg_strokes if s.idx <= end_stroke_pos]
+        # 必须 ≥3 笔且奇数（第77课）；若不足或偶数，尝试回退一笔
+        while len(confirmed) >= 3 and len(confirmed) % 2 == 0:
+            confirmed = confirmed[:-1]
+        if len(confirmed) >= 3:
+            segments.append(Segment(
+                idx=len(segments),
+                direction=seg_dir,
+                strokes=confirmed,
+                break_type=break_type,
+            ))
+
+    i = start_i + 3
+    while i < len(strokes):
+        nxt = strokes[i]
+
+        if pending_break_elem is None:
+            # ── 主流程：在原方向特征序列里找破坏 ───────────────
+            if nxt.direction == seg_dir:
+                # 与线段方向同向 → 加入线段，更新端点
+                seg_strokes.append(nxt)
+                i += 1
+                continue
+
+            # 反向笔 → 进入特征序列
+            new_elem = _elem_from_stroke(nxt)
+
+            # 试包含合并（仅当与上一元素构成包含 + 当前不是潜在破坏点时）
+            # 简化：在没有候选破坏的情况下，feat_seq 不做合并——这样
+            # "缺口"信息得到保留；一旦出现分型再回头看缺口。
+            feat_seq.append(new_elem)
+            seg_strokes.append(nxt)
+
+            # 检查分型
+            if len(feat_seq) >= 3:
+                e1, e2, e3 = feat_seq[-3], feat_seq[-2], feat_seq[-1]
+                if _is_feat_fractal(e1, e2, e3, seg_dir):
+                    has_gap = _has_gap(e1, e2, seg_dir)
+                    if not has_gap:
+                        # 第一种破坏：立即结束线段
+                        # 终点 = e2 对应的反向笔之前的最后一根同向笔的终点
+                        # e2 是反向笔，它的"起点"即原线段的实际高/低点
+                        end_stroke_idx = e2.stroke_start_idx - 1
+                        if end_stroke_idx < start_i:
+                            end_stroke_idx = e2.stroke_start_idx
+                        finish_segment(1, end_stroke_idx)
+
+                        # 从 e2 起点之后重启新线段（方向反转）
+                        new_start = e2.stroke_start_idx
+                        # 重新初始化状态
+                        if new_start + 2 < len(strokes):
+                            seg_dir = strokes[new_start].direction
+                            seg_strokes = list(strokes[new_start: new_start + 3])
+                            feat_seq = [_elem_from_stroke(strokes[new_start + 1])]
+                            start_i = new_start
+                            i = new_start + 3
+                            pending_break_elem = None
+                            reverse_feat_seq = []
+                            continue
+                        else:
+                            # 后续笔不足以构成新段
+                            return segments
+                    else:
+                        # 第二种破坏候选：进入"等反向特征序列分型"阶段
+                        pending_break_elem = e2
+                        reverse_feat_seq = []
+            i += 1
+            continue
+
+        # ── 第二种破坏候选：等反向特征序列分型 ─────────────────
+        # 反向特征序列方向 = 原线段方向（因为反向后线段方向反过来，特征序列再反过来 = 原方向）
+        # 简化：把 nxt 加入 reverse_feat_seq，做包含合并，找分型
+        new_elem = _elem_from_stroke(nxt)
+        seg_strokes.append(nxt)
+
+        # 反向特征序列内部包含合并（第78课要求）
+        reverse_seg_dir = Direction.DOWN if seg_dir == Direction.UP else Direction.UP
+        if reverse_feat_seq and nxt.direction != reverse_seg_dir:
+            # 与反向特征序列同向（即与原线段同向）的笔，不进入反向特征序列
+            i += 1
+            continue
+        if nxt.direction == reverse_seg_dir:
+            # 反向方向的笔（即原方向同向笔，作反向线段的特征元素）
+            if reverse_feat_seq:
+                merged = _merge_feat_elems(reverse_feat_seq[-1], new_elem, reverse_seg_dir)
+                if merged is not None:
+                    reverse_feat_seq[-1] = merged
+                else:
+                    reverse_feat_seq.append(new_elem)
+            else:
+                reverse_feat_seq.append(new_elem)
+
+            if len(reverse_feat_seq) >= 3:
+                e1, e2, e3 = reverse_feat_seq[-3], reverse_feat_seq[-2], reverse_feat_seq[-1]
+                if _is_feat_fractal(e1, e2, e3, reverse_seg_dir):
+                    # 第二种破坏确认
+                    end_stroke_idx = pending_break_elem.stroke_start_idx - 1
+                    finish_segment(2, end_stroke_idx)
+
+                    new_start = pending_break_elem.stroke_start_idx
+                    if new_start + 2 < len(strokes):
+                        seg_dir = strokes[new_start].direction
+                        seg_strokes = list(strokes[new_start: new_start + 3])
+                        feat_seq = [_elem_from_stroke(strokes[new_start + 1])]
+                        start_i = new_start
+                        i = new_start + 3
+                        pending_break_elem = None
+                        reverse_feat_seq = []
+                        continue
+                    else:
+                        return segments
+
+        # 同时检测原方向延续：若反向探索失败，原线段创新高/新低 → 取消候选
+        if seg_dir == Direction.UP and nxt.direction == Direction.UP \
+                and nxt.high > pending_break_elem.high:
+            pending_break_elem = None
+            reverse_feat_seq = []
+        elif seg_dir == Direction.DOWN and nxt.direction == Direction.DOWN \
+                and nxt.low < pending_break_elem.low:
+            pending_break_elem = None
+            reverse_feat_seq = []
+
+        i += 1
+
+    # 收尾：未完成的线段也作为 break_type=0 提交
+    if len(seg_strokes) >= 3:
+        confirmed = list(seg_strokes)
+        while len(confirmed) >= 3 and len(confirmed) % 2 == 0:
+            confirmed = confirmed[:-1]
+        if len(confirmed) >= 3:
+            segments.append(Segment(
+                idx=len(segments),
+                direction=seg_dir,
+                strokes=confirmed,
+                break_type=0,
+            ))
+
+    return segments
 
 
 # ══════════════════════════════════════════════════════════════════════

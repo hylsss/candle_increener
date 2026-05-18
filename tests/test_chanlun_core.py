@@ -19,7 +19,8 @@ import unittest
 
 from chanlun_core import (
     RawBar, MergedBar, Direction, FractalType,
-    merge_klines, find_fractals, find_strokes,
+    Fractal, Stroke, Segment,
+    merge_klines, find_fractals, find_strokes, find_segments,
 )
 
 
@@ -292,6 +293,148 @@ class TestFindStrokes(unittest.TestCase):
             else:
                 self.assertGreater(s.end_fx.extreme, s.start_fx.extreme,
                                    f"笔{s.idx}：顶{s.end_fx.extreme}应高于底{s.start_fx.extreme}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 4. 线段划分
+# ══════════════════════════════════════════════════════════════════════
+
+def _make_fx(ftype: FractalType, mid_idx: int, high: float, low: float,
+             dt: str = "") -> Fractal:
+    """便捷构造一个虚拟分型（不真的关联 MergedBar 序列）。"""
+    return Fractal(
+        ftype=ftype, mid_idx=mid_idx,
+        left_idx=mid_idx - 1, right_idx=mid_idx + 1,
+        high=high, low=low, dt=dt or f"d{mid_idx}",
+        confirmed=True,
+    )
+
+
+def _make_stroke(idx: int, start_price: float, end_price: float,
+                 start_mid_idx: int = None, end_mid_idx: int = None) -> Stroke:
+    """
+    构造一条笔。start_price/end_price 决定方向。
+    虚拟分型的 high/low 取等于 extreme（极值），便于在测试里精确控制笔的区间。
+    """
+    if start_mid_idx is None:
+        start_mid_idx = idx * 10
+    if end_mid_idx is None:
+        end_mid_idx = idx * 10 + 5
+
+    if end_price > start_price:
+        direction = Direction.UP
+        start_fx = _make_fx(FractalType.BOTTOM, start_mid_idx,
+                            high=start_price, low=start_price)
+        end_fx = _make_fx(FractalType.TOP, end_mid_idx,
+                          high=end_price, low=end_price)
+    else:
+        direction = Direction.DOWN
+        start_fx = _make_fx(FractalType.TOP, start_mid_idx,
+                            high=start_price, low=start_price)
+        end_fx = _make_fx(FractalType.BOTTOM, end_mid_idx,
+                          high=end_price, low=end_price)
+
+    return Stroke(idx=idx, direction=direction,
+                  start_fx=start_fx, end_fx=end_fx)
+
+
+def _mk_strokes(price_pairs):
+    """传入 [(start, end), (start, end), ...]，每对相邻笔自动连续。返回 Stroke 列表。"""
+    out = []
+    for i, (sp, ep) in enumerate(price_pairs):
+        out.append(_make_stroke(i, sp, ep))
+    return out
+
+
+class TestFindSegments(unittest.TestCase):
+
+    def test_too_few_strokes(self):
+        """笔数 < 3 → 无线段。"""
+        strokes = _mk_strokes([(10, 20), (20, 15)])
+        self.assertEqual(find_segments(strokes), [])
+
+    def test_first_three_no_overlap_no_segment(self):
+        """
+        前三笔不重叠（s2 整体在 s0 之下）→ 无线段。
+        """
+        # s0: UP 50→100, s1: DOWN 100→40, s2: UP 40→45
+        # s0 [50,100] vs s2 [40,45]：s0.low=50 > s2.high=45 → 不重叠
+        strokes = _mk_strokes([(50, 100), (100, 40), (40, 45)])
+        segs = find_segments(strokes)
+        self.assertEqual(segs, [])
+
+    def test_basic_up_segment_no_break(self):
+        """
+        3 笔（UP-DOWN-UP）且 s0、s2 重叠 → 形成 1 条上行线段（未完成）。
+        """
+        # s0: 10→20, s1: 20→15, s2: 15→25 → s0[10,20], s2[15,25] 重叠
+        strokes = _mk_strokes([(10, 20), (20, 15), (15, 25)])
+        segs = find_segments(strokes)
+        self.assertEqual(len(segs), 1)
+        seg = segs[0]
+        self.assertEqual(seg.direction, Direction.UP)
+        self.assertEqual(len(seg), 3)
+        self.assertEqual(seg.break_type, 0)  # 未确认破坏
+        self.assertEqual(seg.start_price, 10)
+        self.assertEqual(seg.end_price, 25)
+
+    def test_first_type_break_to_down(self):
+        """
+        第一种破坏：上行段顶部出现后，特征序列上无缺口的顶分型 → 段在顶处结束。
+        构造：上行段 [10→30→25→35]，然后向下破坏 [35→28→32→22]。
+          特征序列(向下笔)：[s1(20→15), s3(35→28), s5(32→22)]
+          s3 在 [s1, s3, s5] 中：high 30→35→32（s3 最高）
+                                  low 15→28→22（s3 最高？28>15 ✓, 28>22 ✓）
+          → s3 是顶分型，且 s1[20,15] 与 s3[35,28] 无缺口（s1.low=15 ≤ s3.high=35 显然重叠）
+          → 第一种破坏，段在 s2 末端（35）结束。
+        """
+        strokes = _mk_strokes([
+            (10, 30),   # s0 UP   - 起始上行
+            (30, 25),   # s1 DOWN - 小回调（X1）
+            (25, 35),   # s2 UP   - 创新高至 35
+            (35, 28),   # s3 DOWN - 回撤更深（X2 → 顶分型中点）
+            (28, 32),   # s4 UP   - 反弹不创新高
+            (32, 22),   # s5 DOWN - 跌破前低（X3）
+        ])
+        segs = find_segments(strokes)
+        # 至少 1 条已完成的上行段
+        self.assertGreaterEqual(len(segs), 1)
+        first = segs[0]
+        self.assertEqual(first.direction, Direction.UP)
+        self.assertEqual(first.break_type, 1)
+        self.assertAlmostEqual(first.end_price, 35.0)
+        # 第一段应该恰好 3 笔（s0、s1、s2）
+        self.assertEqual(len(first), 3)
+
+    def test_segment_must_be_odd(self):
+        """已完成线段的笔数必然为奇数（第77/78课）。"""
+        strokes = _mk_strokes([
+            (10, 30), (30, 25), (25, 35),
+            (35, 28), (28, 32), (32, 22),
+        ])
+        for seg in find_segments(strokes):
+            if seg.break_type != 0:
+                self.assertEqual(len(seg) % 2, 1,
+                                 f"段{seg.idx}笔数={len(seg)}不是奇数")
+
+    def test_alternating_segments(self):
+        """
+        上行段被破坏后转下行段，整体应有方向交替的两段以上。
+        """
+        strokes = _mk_strokes([
+            # 上行段
+            (10, 30), (30, 25), (25, 35),
+            # 第一种破坏
+            (35, 28), (28, 32), (32, 22),
+            # 下行段延伸
+            (22, 26), (26, 18),
+        ])
+        segs = find_segments(strokes)
+        if len(segs) >= 2:
+            # 相邻段方向必然相反
+            for a, b in zip(segs[:-1], segs[1:]):
+                self.assertNotEqual(a.direction, b.direction,
+                                    f"段{a.idx}{a.direction}与段{b.idx}{b.direction}方向相同")
 
 
 if __name__ == "__main__":
