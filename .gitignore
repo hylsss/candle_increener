@@ -7,3 +7,6 @@ build/
 .env
 service_account.json
 *.xlsx
+
+# 缠论原始教材（仅本地学习用，不入库）
+.chanlun_raw/

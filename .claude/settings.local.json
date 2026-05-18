@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"D:\\\\BaiduNetdiskDownload\\\\\" 2>&1 | head -50)",
+      "Bash(ls \"D:\\\\Github\\\\candle_increener\\\\\")",
+      "PowerShell(Get-Command 7z, 7z.exe, unrar, winrar -ErrorAction SilentlyContinue)",
+      "PowerShell($cmds = @\\(\\); foreach\\($n in @\\('7z','7z.exe','unrar','winrar','rar'\\)\\){ try { $c = Get-Command $n -ErrorAction Stop; $cmds += $c } catch {} }; $cmds | Format-Table Name, Source -AutoSize; Get-ChildItem \"C:\\\\Program Files\\\\7-Zip\",\"C:\\\\Program Files\\\\WinRAR\" -ErrorAction SilentlyContinue | Select-Object FullName)",
+      "PowerShell($paths = @\\('C:\\\\Program Files\\\\7-Zip\\\\7z.exe','C:\\\\Program Files \\(x86\\)\\\\7-Zip\\\\7z.exe','C:\\\\Program Files\\\\WinRAR\\\\WinRAR.exe','C:\\\\Program Files\\\\WinRAR\\\\Rar.exe','C:\\\\Program Files\\\\WinRAR\\\\UnRAR.exe','C:\\\\Program Files \\(x86\\)\\\\WinRAR\\\\UnRAR.exe'\\); $paths | ForEach-Object { if \\(Test-Path $_\\) { Write-Output \"FOUND: $_\" } })",
+      "Bash(git -C \"D:/Github/candle_increener\" branch -a)",
+      "PowerShell(try { $w = New-Object -ComObject Word.Application; \"Word OK: $\\($w.Version\\)\"; $w.Quit\\(\\) } catch { \"Word not available: $\\($_.Exception.Message\\)\" }; try { & soffice --version 2>&1 } catch {}; try { Get-Command pandoc -ErrorAction Stop | Select-Object Source } catch {})",
+      "Bash(xxd)",
+      "Bash(python -c \"import akshare; print\\(akshare.__version__\\)\")",
+      "Bash(python -m unittest tests.test_chanlun_core -v)",
+      "Bash(python tests/smoke_real_stock.py 600519)",
+      "Bash(python -c \"import sys; [print\\(l\\) for l in sys.stdin]\")"
+    ]
+  }
+}
