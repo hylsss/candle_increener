@@ -12,7 +12,7 @@ CHANLUN_NOTES.md 中有完整引用，本文件每一步实现都标注对应课
   Phase 1.3  find_strokes     ── 笔的划分（第77课3步法）             ✅
   Phase 1.4  find_segments    ── 线段划分（第67/71/77/78课）         ✅
   Phase 1.5  find_pivots      ── 中枢识别（第17/20/29课）            ✅
-  Phase 1.6  detect_divergence── MACD背驰                            🚧
+  Phase 1.6  detect_divergence── MACD背驰（第24/25/27/50课）         ✅
   Phase 1.7  find_signals     ── 1/2/3类买卖点                       🚧
 """
 
@@ -920,6 +920,223 @@ def find_pivots(segments: list[Segment]) -> list[Pivot]:
         i = j
 
     return pivots
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 6. MACD 与背驰检测 — 第24/25/27/50/65课
+# ══════════════════════════════════════════════════════════════════════
+#
+# 实现层次：
+#   ① calc_macd            标准 12/26/9 EMA → DIFF/DEA/柱(=2*(DIFF-DEA))
+#   ② segment_macd_area    把段映射回原始K线区间，求方向匹配的柱面积绝对值
+#   ③ detect_divergence    同向段两两对比：C 段创新极但面积 < A 段 → 背驰
+#
+# 关键原文：
+#   - 第25课：MACD 参数 12/26/9，黄白线=DIFF/DEA，柱=2*(DIFF-DEA)
+#   - 第24课："C 段的走势类型完成时对应的 MACD 柱子面积比 A 段对应的面积要小，
+#             这时候就构成标准的背弛"
+#   - 第27课："第一类买点都是在 0 轴之下背驰形成的"——本实现把"0 轴位置"
+#             作为附加判据：UP 背驰要求 A 段最大 DIFF 在 0 轴上方；
+#             DOWN 背驰要求 A 段最小 DIFF 在 0 轴下方。
+#   - 第50课：MACD 是辅助——本模块只在已有段结构后调用，不直接驱动判断。
+#   - 第65课：线段以下的背驰称"类背驰"，力度比较方法相同。
+#
+# 注意：
+#   - "创新极"是背驰必要条件：UP 段要 high > 前 UP 段 high；DOWN 段反之。
+#   - 背驰类型粒度本版只输出"段级类背驰"，趋势/盘整背驰需结合中枢上下文，
+#     由 Phase 1.7 的买卖点逻辑判断时再叠加。
+# ══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class MACDPoint:
+    """单根K线的 MACD 三元组。bar = 2*(diff - dea)。"""
+    diff: float
+    dea: float
+    bar: float
+
+
+@dataclass
+class Divergence:
+    """
+    一次背驰记录（段级别力度比较）。
+      seg_a_idx / seg_c_idx  对比的两段在 segments 列表中的下标
+      direction              方向（UP=顶背驰，DOWN=底背驰）
+      area_a / area_c        两段 MACD 柱面积（绝对值之和）
+      price_a / price_c      两段的极值（UP=high，DOWN=low）
+      diff_a / diff_c        两段对应区间的 DIFF 极值（UP取max，DOWN取min）
+                             用于"0 轴判定"：第27课"第一类买点在 0 轴之下"。
+    """
+    seg_a_idx: int
+    seg_c_idx: int
+    direction: Direction
+    area_a: float
+    area_c: float
+    price_a: float
+    price_c: float
+    diff_a: float
+    diff_c: float
+
+    @property
+    def ratio(self) -> float:
+        """C 段面积 / A 段面积。越小背驰越强。"""
+        return self.area_c / self.area_a if self.area_a > 0 else 0.0
+
+
+def _ema(values: list[float], period: int) -> list[float]:
+    """
+    指数移动平均（EMA）。
+    标准递推：EMA_t = alpha * x_t + (1 - alpha) * EMA_{t-1}，其中 alpha = 2/(period+1)。
+    种子值取 values[0]（行业惯用，等同于通达信"先用首值再迭代"）。
+    """
+    if not values:
+        return []
+    alpha = 2.0 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * alpha + out[-1] * (1.0 - alpha))
+    return out
+
+
+def calc_macd(closes: list[float],
+              fast: int = 12, slow: int = 26, signal: int = 9
+              ) -> list[MACDPoint]:
+    """
+    标准 MACD（第25课参数 12/26/9）。
+      DIFF = EMA(close, fast) - EMA(close, slow)
+      DEA  = EMA(DIFF, signal)
+      bar  = 2 * (DIFF - DEA)
+    """
+    if not closes:
+        return []
+    ef = _ema(closes, fast)
+    es = _ema(closes, slow)
+    diff = [f - s for f, s in zip(ef, es)]
+    dea = _ema(diff, signal)
+    return [MACDPoint(diff=d, dea=e, bar=2.0 * (d - e))
+            for d, e in zip(diff, dea)]
+
+
+def _segment_raw_range(merged: list[MergedBar], segment: Segment) -> tuple[int, int]:
+    """
+    把段映射回原始K线下标区间 [start_raw, end_raw]（闭区间）。
+    用段首笔起点分型所在合并K线的首根原始下标，到段末笔终点分型所在合并K线
+    的末根原始下标。
+    """
+    start_mid = segment.strokes[0].start_fx.mid_idx
+    end_mid = segment.strokes[-1].end_fx.mid_idx
+    start_raw = merged[start_mid].raw_indices[0]
+    end_raw = merged[end_mid].raw_indices[-1]
+    return start_raw, end_raw
+
+
+def segment_macd_area(macd: list[MACDPoint],
+                      merged: list[MergedBar],
+                      segment: Segment) -> float:
+    """
+    求一段对应原始K线区间内、与段方向匹配的 MACD 柱的绝对值之和。
+      UP 段：累加所有 bar > 0 的柱；
+      DOWN 段：累加所有 bar < 0 的柱（取绝对值）。
+    第24课原文用"红柱面积"、"绿柱面积"，对应这两种情形。
+    """
+    start_raw, end_raw = _segment_raw_range(merged, segment)
+    area = 0.0
+    for i in range(start_raw, min(end_raw + 1, len(macd))):
+        b = macd[i].bar
+        if segment.direction == Direction.UP and b > 0:
+            area += b
+        elif segment.direction == Direction.DOWN and b < 0:
+            area += -b
+    return area
+
+
+def _segment_diff_extreme(macd: list[MACDPoint],
+                          merged: list[MergedBar],
+                          segment: Segment) -> float:
+    """段对应原始K线区间内的 DIFF 极值：UP 取最大，DOWN 取最小。"""
+    start_raw, end_raw = _segment_raw_range(merged, segment)
+    span = macd[start_raw: min(end_raw + 1, len(macd))]
+    if not span:
+        return 0.0
+    if segment.direction == Direction.UP:
+        return max(p.diff for p in span)
+    return min(p.diff for p in span)
+
+
+def detect_divergence(segments: list[Segment],
+                      merged: list[MergedBar],
+                      raws: list[RawBar],
+                      require_zero_axis: bool = True,
+                      ) -> list[Divergence]:
+    """
+    段级别"类背驰"检测。
+
+    算法：
+      1. 用收盘价算 MACD。
+      2. 对每个段 C（idx ≥ 2），向前找最近的"同向段" A。
+         由于线段方向严格交替，A = segments[c_idx - 2]、segments[c_idx - 4] …
+         本实现取最近的同向段（即 c_idx - 2）作为基准——满足"相邻两个同向
+         走势段"的最简对比；多中枢趋势对比留给 Phase 1.7 整合后再扩展。
+      3. C 必须创新极：UP → C.high > A.high；DOWN → C.low < A.low。
+         不创新极不算背驰（第24课）。
+      4. 面积比较：area_c < area_a → 背驰候选。
+      5. 0 轴判定（require_zero_axis=True，第27课）：
+           UP 背驰要求 A 段 DIFF 最大值 > 0（即"0 轴之上的顶背驰"）；
+           DOWN 背驰要求 A 段 DIFF 最小值 < 0（"0 轴之下的底背驰"）。
+         传入 False 可放宽（线段以下"类背驰"常无此约束）。
+
+    返回所有满足条件的 Divergence 记录。
+    """
+    if len(segments) < 3 or not raws:
+        return []
+
+    closes = [r.close for r in raws]
+    macd = calc_macd(closes)
+    if not macd:
+        return []
+
+    # 预先缓存每段的面积与 DIFF 极值
+    n_seg = len(segments)
+    areas = [segment_macd_area(macd, merged, s) for s in segments]
+    diffs = [_segment_diff_extreme(macd, merged, s) for s in segments]
+
+    results: list[Divergence] = []
+    for c_idx in range(2, n_seg):
+        a_idx = c_idx - 2  # 最近的同向段
+        if segments[a_idx].direction != segments[c_idx].direction:
+            # 防御：理论上线段交替方向，差 2 必同向；防止异常数据
+            continue
+        seg_a, seg_c = segments[a_idx], segments[c_idx]
+
+        # 创新极
+        if seg_c.direction == Direction.UP:
+            if seg_c.high <= seg_a.high:
+                continue
+        else:
+            if seg_c.low >= seg_a.low:
+                continue
+
+        # 面积比较
+        if areas[c_idx] >= areas[a_idx]:
+            continue
+
+        # 0 轴判定（可选）
+        if require_zero_axis:
+            if seg_c.direction == Direction.UP and diffs[a_idx] <= 0:
+                continue
+            if seg_c.direction == Direction.DOWN and diffs[a_idx] >= 0:
+                continue
+
+        results.append(Divergence(
+            seg_a_idx=a_idx, seg_c_idx=c_idx,
+            direction=seg_c.direction,
+            area_a=areas[a_idx], area_c=areas[c_idx],
+            price_a=seg_a.high if seg_c.direction == Direction.UP else seg_a.low,
+            price_c=seg_c.high if seg_c.direction == Direction.UP else seg_c.low,
+            diff_a=diffs[a_idx], diff_c=diffs[c_idx],
+        ))
+
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════

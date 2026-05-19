@@ -15,7 +15,10 @@
       "Bash(python -c \"import sys; [print\\(l\\) for l in sys.stdin]\")",
       "Bash(python -m pytest tests/test_chanlun_core.py -v)",
       "Bash(python -c \"from chanlun_core import find_pivots, Pivot; print\\('ok', Pivot\\)\")",
-      "Bash(python tests/smoke_real_stock.py 000001)"
+      "Bash(python tests/smoke_real_stock.py 000001)",
+      "Bash(python tests/smoke_real_stock.py 002594)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

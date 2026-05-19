@@ -17,7 +17,7 @@ import akshare as ak
 from chanlun_core import (
     Direction, FractalType,
     from_dataframe, merge_klines, find_fractals, find_strokes,
-    find_segments, find_pivots,
+    find_segments, find_pivots, detect_divergence,
 )
 
 
@@ -108,6 +108,20 @@ def main(code: str = "600519"):
               f"  [{p.zd:.2f}, {p.zg:.2f}]"
               f"  DD/GG=[{p.dd:.2f}, {p.gg:.2f}]"
               f"  {len(p)}段 {status}")
+
+    # 背驰：段级类背驰（不强制 0 轴判定，便于观察）
+    print()
+    divs = detect_divergence(segments, merged, raws, require_zero_axis=False)
+    print(f"  背驰 {len(divs)}（段级类背驰；require_zero_axis=False）")
+    for d in divs[-5:]:
+        arrow = "顶" if d.direction == Direction.UP else "底"
+        seg_a = segments[d.seg_a_idx]
+        seg_c = segments[d.seg_c_idx]
+        print(f"    [{arrow}背] A段 {seg_a.start_fx.dt}→{seg_a.end_fx.dt} "
+              f"{d.price_a:.2f}  vs  C段 {seg_c.start_fx.dt}→{seg_c.end_fx.dt} "
+              f"{d.price_c:.2f}")
+        print(f"        面积 {d.area_a:.4f} → {d.area_c:.4f} "
+              f"(C/A={d.ratio:.2%})  DIFF极值 {d.diff_a:+.4f} → {d.diff_c:+.4f}")
 
 
 if __name__ == "__main__":

@@ -19,8 +19,9 @@ import unittest
 
 from chanlun_core import (
     RawBar, MergedBar, Direction, FractalType,
-    Fractal, Stroke, Segment, Pivot,
+    Fractal, Stroke, Segment, Pivot, MACDPoint, Divergence,
     merge_klines, find_fractals, find_strokes, find_segments, find_pivots,
+    calc_macd, segment_macd_area, detect_divergence,
 )
 
 
@@ -627,6 +628,229 @@ class TestFindPivots(unittest.TestCase):
         p = find_pivots(segs)[0]
         self.assertLess(p.dd, p.zd)          # 10 < 15
         self.assertGreater(p.gg, p.zg)       # 20 > 18
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 6. MACD 与背驰
+# ══════════════════════════════════════════════════════════════════════
+
+class TestCalcMACD(unittest.TestCase):
+
+    def test_empty(self):
+        self.assertEqual(calc_macd([]), [])
+
+    def test_constant_series(self):
+        """常数收盘价：DIFF/DEA/bar 全为 0。"""
+        macd = calc_macd([10.0] * 30)
+        self.assertEqual(len(macd), 30)
+        for p in macd:
+            self.assertAlmostEqual(p.diff, 0.0)
+            self.assertAlmostEqual(p.dea, 0.0)
+            self.assertAlmostEqual(p.bar, 0.0)
+
+    def test_rising_series_positive_bar_eventually(self):
+        """
+        持续上涨 → DIFF 最终为正、DEA 也为正、bar 正负取决于二者差。
+        我们只验证：序列末段 DIFF > 0（足够上涨后 fast EMA 高于 slow EMA）。
+        """
+        prices = [float(10 + i * 0.5) for i in range(60)]
+        macd = calc_macd(prices)
+        self.assertGreater(macd[-1].diff, 0.0)
+        self.assertGreater(macd[-1].dea, 0.0)
+
+    def test_falling_then_rising_bar_sign_flip(self):
+        """先跌后涨 → 柱子由负转正。"""
+        prices = [float(20 - i * 0.3) for i in range(30)] \
+               + [float(11 + i * 0.5) for i in range(30)]
+        macd = calc_macd(prices)
+        # 下跌末端柱应为负
+        mid_bar = macd[29].bar
+        end_bar = macd[-1].bar
+        self.assertLess(mid_bar, 0.0)
+        self.assertGreater(end_bar, 0.0)
+
+
+# ── 直接构造段/合并K/原始K，便于背驰测试 ─────────────────────────────
+#
+# 思路：背驰检测不关心段的内部结构，只用到 Segment.high/low/direction +
+# 段首/末分型在 merged 上的 mid_idx → merged[mid_idx].raw_indices。
+# 所以我们手工搭一个最小可用的链：
+#   raws[i] = RawBar(close=closes[i], high/low 围绕 close 略加扰动)
+#   merged[i] = MergedBar(raw_indices=[i])（无包含合并）
+#   段用 _make_stroke 包一笔，但分型的 mid_idx 必须指向具体的 merged 下标
+#
+def _make_fx_at(ftype: FractalType, mid_idx: int, price: float) -> Fractal:
+    """在指定 mid_idx 上构造分型；high/low 都取 price，便于精确控制段端价。"""
+    return Fractal(
+        ftype=ftype, mid_idx=mid_idx,
+        left_idx=max(0, mid_idx - 1), right_idx=mid_idx + 1,
+        high=price, low=price, dt=f"d{mid_idx}", confirmed=True,
+    )
+
+
+def _make_segment_at(idx: int, start_mid: int, start_price: float,
+                     end_mid: int, end_price: float) -> Segment:
+    """构造一段，分型挂在指定的 merged 下标上。"""
+    if end_price > start_price:
+        direction = Direction.UP
+        start_fx = _make_fx_at(FractalType.BOTTOM, start_mid, start_price)
+        end_fx = _make_fx_at(FractalType.TOP, end_mid, end_price)
+    else:
+        direction = Direction.DOWN
+        start_fx = _make_fx_at(FractalType.TOP, start_mid, start_price)
+        end_fx = _make_fx_at(FractalType.BOTTOM, end_mid, end_price)
+    stroke = Stroke(idx=0, direction=direction,
+                    start_fx=start_fx, end_fx=end_fx)
+    return Segment(idx=idx, direction=direction, strokes=[stroke])
+
+
+def _build_macd_fixture(closes: list[float]):
+    """
+    把收盘价序列封装成 (raws, merged)；每根原始K线 = 一根合并K线。
+    返回的 raws / merged 可直接喂给 segment_macd_area / detect_divergence。
+    """
+    raws = [
+        RawBar(idx=i, dt=f"d{i}", open=c, close=c,
+               high=c + 0.5, low=c - 0.5, volume=1000)
+        for i, c in enumerate(closes)
+    ]
+    merged = [
+        MergedBar(idx=i, dt=f"d{i}", high=c + 0.5, low=c - 0.5,
+                  direction=Direction.UP, raw_indices=[i])
+        for i, c in enumerate(closes)
+    ]
+    return raws, merged
+
+
+class TestSegmentMACDArea(unittest.TestCase):
+
+    def test_area_only_counts_matching_direction(self):
+        """UP 段只累加红柱（bar>0）；DOWN 段只累加绿柱（bar<0）。"""
+        # 价格先涨后跌：前 30 根涨，后 30 根跌。
+        closes = [10 + i * 0.5 for i in range(30)] \
+               + [25 - i * 0.5 for i in range(30)]
+        raws, merged = _build_macd_fixture(closes)
+        macd = calc_macd(closes)
+
+        up_seg = _make_segment_at(0, start_mid=0, start_price=10,
+                                  end_mid=29, end_price=25)
+        down_seg = _make_segment_at(1, start_mid=29, start_price=25,
+                                    end_mid=59, end_price=10)
+
+        up_area = segment_macd_area(macd, merged, up_seg)
+        down_area = segment_macd_area(macd, merged, down_seg)
+        self.assertGreater(up_area, 0.0)
+        self.assertGreater(down_area, 0.0)
+
+    def test_area_zero_when_no_matching_bars(self):
+        """常数价格 → bar 全 0 → 任意方向段面积为 0。"""
+        closes = [15.0] * 50
+        raws, merged = _build_macd_fixture(closes)
+        macd = calc_macd(closes)
+        seg = _make_segment_at(0, start_mid=0, start_price=15,
+                               end_mid=49, end_price=15.001)  # 强行 UP
+        self.assertAlmostEqual(segment_macd_area(macd, merged, seg), 0.0)
+
+
+class TestDetectDivergence(unittest.TestCase):
+
+    def test_too_few_segments(self):
+        self.assertEqual(detect_divergence([], [], []), [])
+
+    def test_top_divergence_basic(self):
+        """
+        构造：第1段强势上涨 → 回调 → 第3段缓慢创新高（MACD 力度弱）→ 顶背驰。
+        """
+        # 强上涨 30 根：从 10 到 25（陡）
+        closes = [10 + i * 0.5 for i in range(30)]
+        # 回调 30 根：25 → 16
+        closes += [25 - i * 0.3 for i in range(30)]
+        # 缓涨 60 根：16 → 26（仅略破前高 25）
+        closes += [16 + i * (10.0 / 60) for i in range(60)]
+
+        raws, merged = _build_macd_fixture(closes)
+        seg_a = _make_segment_at(0, 0, 10, 29, 25)
+        seg_b = _make_segment_at(1, 29, 25, 59, 16)
+        seg_c = _make_segment_at(2, 59, 16, 119, 26)
+
+        divs = detect_divergence([seg_a, seg_b, seg_c], merged, raws,
+                                 require_zero_axis=False)
+        self.assertEqual(len(divs), 1)
+        d = divs[0]
+        self.assertEqual(d.direction, Direction.UP)
+        self.assertEqual((d.seg_a_idx, d.seg_c_idx), (0, 2))
+        self.assertLess(d.area_c, d.area_a)
+        self.assertGreater(d.price_c, d.price_a)   # 26 > 25
+
+    def test_no_new_extreme_no_divergence(self):
+        """C 段未创新高 → 不算背驰，即使面积更小。"""
+        closes = [10 + i * 0.5 for i in range(30)]     # 强上涨到 25
+        closes += [25 - i * 0.3 for i in range(30)]    # 回调到 16
+        closes += [16 + i * (5.0 / 60) for i in range(60)]  # 仅涨到 21（未破 25）
+
+        raws, merged = _build_macd_fixture(closes)
+        seg_a = _make_segment_at(0, 0, 10, 29, 25)
+        seg_b = _make_segment_at(1, 29, 25, 59, 16)
+        seg_c = _make_segment_at(2, 59, 16, 119, 21)
+
+        divs = detect_divergence([seg_a, seg_b, seg_c], merged, raws,
+                                 require_zero_axis=False)
+        self.assertEqual(divs, [])
+
+    def test_stronger_c_no_divergence(self):
+        """C 段力度大于 A → 不算背驰。"""
+        # 第1段缓涨，第3段陡涨
+        closes = [10 + i * 0.1 for i in range(40)]    # 10 → 14
+        closes += [14 - i * 0.05 for i in range(20)]  # 回调到 13
+        closes += [13 + i * 0.5 for i in range(30)]   # 13 → 28，远超前高
+
+        raws, merged = _build_macd_fixture(closes)
+        seg_a = _make_segment_at(0, 0, 10, 39, 14)
+        seg_b = _make_segment_at(1, 39, 14, 59, 13)
+        seg_c = _make_segment_at(2, 59, 13, 89, 28)
+
+        divs = detect_divergence([seg_a, seg_b, seg_c], merged, raws,
+                                 require_zero_axis=False)
+        self.assertEqual(divs, [])  # C 力度更强 → 非背驰
+
+    def test_bottom_divergence_basic(self):
+        """构造底背驰：强下跌 → 反弹 → 缓跌破前低（MACD 弱）。"""
+        closes = [25 - i * 0.5 for i in range(30)]   # 25 → 10 强跌
+        closes += [10 + i * 0.3 for i in range(30)]  # 10 → 19 反弹
+        closes += [19 - i * (10.0 / 60) for i in range(60)]  # 19 → 9 缓跌（破 10）
+
+        raws, merged = _build_macd_fixture(closes)
+        seg_a = _make_segment_at(0, 0, 25, 29, 10)
+        seg_b = _make_segment_at(1, 29, 10, 59, 19)
+        seg_c = _make_segment_at(2, 59, 19, 119, 9)
+
+        divs = detect_divergence([seg_a, seg_b, seg_c], merged, raws,
+                                 require_zero_axis=False)
+        self.assertEqual(len(divs), 1)
+        d = divs[0]
+        self.assertEqual(d.direction, Direction.DOWN)
+        self.assertLess(d.price_c, d.price_a)   # 9 < 10
+        self.assertLess(d.area_c, d.area_a)
+
+    def test_zero_axis_filter(self):
+        """
+        require_zero_axis=True 时，A 段 DIFF 极值需符号正确。
+        构造一个 DIFF 始终在 0 轴附近的弱场景，背驰被过滤。
+        """
+        # 整体微涨：DIFF 不大可能远超 0
+        closes = [10 + 0.001 * i for i in range(200)]
+        raws, merged = _build_macd_fixture(closes)
+        seg_a = _make_segment_at(0, 0, 10.0, 99, 10.099)
+        seg_b = _make_segment_at(1, 99, 10.099, 149, 10.05)
+        seg_c = _make_segment_at(2, 149, 10.05, 199, 10.199)  # 创新高
+
+        # 不要求 0 轴：可能有结果（也可能没有，取决于具体面积）
+        loose = detect_divergence([seg_a, seg_b, seg_c], merged, raws,
+                                  require_zero_axis=False)
+        strict = detect_divergence([seg_a, seg_b, seg_c], merged, raws,
+                                   require_zero_axis=True)
+        # 严格模式不会比宽松模式更多结果
+        self.assertLessEqual(len(strict), len(loose))
 
 
 if __name__ == "__main__":
