@@ -244,6 +244,11 @@ def _scan_one_with_hist(code, name, hist):
         "目标空间%": _round((target - close) / close * 100),
         "风险收益比": _round(rr),
         "ATR": _round(atr),
+        # 缠论字段在原 backtest 框架里不计算（每日切片重跑成本高）；
+        # 真正的缠论回测请用 chanlun_backtest.py
+        "缠论信号": "",
+        "缠论日期": "",
+        "缠论价":   "",
         "扫描时间": "",
     }
 

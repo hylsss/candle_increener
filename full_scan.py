@@ -20,8 +20,12 @@ OUTPUT_COLUMNS = [
     "①激进买入", "②回调买入", "③突破买入",
     "🚀突破触发价", "📍均线触发价", "🌅抄底关注价", "触发条件",
     "止损价", "止损距离%", "目标价", "目标空间%", "风险收益比",
-    "ATR", "扫描时间",
+    "ATR", "缠论信号", "缠论日期", "缠论价",
+    "扫描时间",
 ]
+
+# 缠论信号取信号后这么多日内的最新一个；过老不显示
+CHANLUN_LOOKBACK_DAYS = 30
 
 
 def get_universe(min_price=3.0, max_price=500.0, min_turnover=0.3,
@@ -94,21 +98,25 @@ def run_full_scan(universe, period="1y", workers=10):
 
 
 STRATEGY_NAMES = {
-    "breakout": "🚀 突破追涨",
-    "pullback": "🔄 强势回踩",
-    "reversal": "🌅 底部反转",
-    "high_rr":  "📈 高RR精选",
+    "breakout":  "🚀 突破追涨",
+    "pullback":  "🔄 强势回踩",
+    "reversal":  "🌅 底部反转",
+    "high_rr":   "📈 高RR精选",
+    "chanlun_b2": "🔍 缠论B2观察",
 }
 
 
 def pick_strategies(df, max_per_strategy=30):
     """
-    按 4 个策略从扫描结果里选股。返回 dict[策略名 -> DataFrame]。
+    按 5 个策略从扫描结果里选股。返回 dict[策略名 -> DataFrame]。
 
     🚀 突破追涨：当前价距 🚀突破触发价 ≤ 3% + 趋势 ≥ 60
     🔄 强势回踩：上升趋势 ≥ 65 + 当前价距 MA20 ≤ 3% + 出现下影线/吞噬类买入信号
     🌅 底部反转：趋势=底部转强 + 出现 启明星/锤子/看涨吞噬/刺穿 之一
     📈 高RR精选：信号=🟢 买入观察 + R:R ≥ 2.5 + 趋势 ≥ 60
+    🔍 缠论B2观察：近 30 日触发缠论 B2 信号（5/10/20 日 walk-forward 回测里
+                    唯一显现弱正 alpha 的信号类型，仅作"观察提示"，不做硬性
+                    买入建议；建议配合其他策略做交叉确认）
     """
     empty = df.iloc[:0].copy()
     if df.empty:
@@ -156,6 +164,13 @@ def pick_strategies(df, max_per_strategy=30):
     if not hr.empty:
         hr = hr.sort_values("_rr", ascending=False)
 
+    # 🔍 缠论 B2 观察：近 N 日内触发缠论 B2 信号
+    cl = pd.DataFrame()
+    if "缠论信号" in d.columns:
+        cl = d[d["缠论信号"].fillna("").str.startswith("B2")].copy()
+        if not cl.empty:
+            cl = cl.sort_values(["缠论日期", "_trend"], ascending=[False, False])
+
     def _clean(picked):
         return picked.head(max_per_strategy).drop(
             columns=[c for c in drop_aux if c in picked.columns],
@@ -163,10 +178,11 @@ def pick_strategies(df, max_per_strategy=30):
         ).reset_index(drop=True)
 
     return {
-        STRATEGY_NAMES["breakout"]: _clean(bo),
-        STRATEGY_NAMES["pullback"]: _clean(pb),
-        STRATEGY_NAMES["reversal"]: _clean(rv),
-        STRATEGY_NAMES["high_rr"]:  _clean(hr),
+        STRATEGY_NAMES["breakout"]:   _clean(bo),
+        STRATEGY_NAMES["pullback"]:   _clean(pb),
+        STRATEGY_NAMES["reversal"]:   _clean(rv),
+        STRATEGY_NAMES["high_rr"]:    _clean(hr),
+        STRATEGY_NAMES["chanlun_b2"]: _clean(cl),
     }
 
 
@@ -224,6 +240,8 @@ def _scan_one(stock, period):
         trend_type, trend_score, rr, buy_patterns, sell_patterns, close, last
     )
 
+    cl_type, cl_dt, cl_price = _latest_chanlun_signal(hist, CHANLUN_LOOKBACK_DAYS)
+
     return {
         "代码":      code,
         "名称":      name,
@@ -248,8 +266,58 @@ def _scan_one(stock, period):
         "目标空间%": _round((target - close) / close * 100),
         "风险收益比": _round(rr),
         "ATR":       _round(atr),
+        "缠论信号":  cl_type or "",
+        "缠论日期":  cl_dt or "",
+        "缠论价":    _round(cl_price) if cl_price is not None else "",
         "扫描时间":  datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
+
+
+def _latest_chanlun_signal(hist, lookback_days: int):
+    """
+    在最近 lookback_days 个交易日内找最新的一个缠论信号。
+    返回 (signal_type, dt, price)；无则全 None。
+    异常时静默吞掉，避免污染全市场扫描。
+    """
+    if len(hist) < 100:
+        return None, None, None
+    try:
+        from chanlun_core import (
+            from_dataframe, merge_klines, find_fractals, find_strokes,
+            find_segments, find_pivots, detect_divergence, find_signals,
+        )
+        raws = from_dataframe(hist)
+        merged = merge_klines(raws)
+        fxs = find_fractals(merged)
+        strokes = find_strokes(merged, fxs, new_stroke=True)
+        segments = find_segments(strokes)
+        if len(segments) < 3:
+            return None, None, None
+        pivots = find_pivots(segments)
+        divs = detect_divergence(segments, merged, raws, require_zero_axis=False)
+        signals = find_signals(segments, pivots, divs)
+    except Exception:
+        return None, None, None
+
+    if not signals:
+        return None, None, None
+
+    date_to_idx = {str(d): i for i, d in enumerate(hist["日期"])}
+    last_idx = len(hist) - 1
+
+    recent = []
+    for sig in signals:
+        sig_idx = date_to_idx.get(str(sig.dt))
+        if sig_idx is None:
+            continue
+        if last_idx - sig_idx <= lookback_days:
+            recent.append((sig_idx, sig))
+    if not recent:
+        return None, None, None
+
+    recent.sort(key=lambda x: x[0], reverse=True)
+    _, sig = recent[0]
+    return sig.signal_type, sig.dt, sig.price
 
 
 def _fetch_history(code, period):
