@@ -509,29 +509,41 @@ def find_strokes(merged: list[MergedBar],
             continue
 
         # ── 不成笔：按"唯一性"原则做撤回 ─────────────────────────
-        # 情况 A：fx 与 anchor 同性质（夹在它们之间的异性质分型已被废弃/合并）
-        #   → 若 fx 更极，替换 anchor；若不如 anchor 极，丢弃 fx。
+        # 情况 A：fx 与 anchor 同性质 → 第77课"同性相邻保留更极者"
         if fx.ftype == anchor.ftype:
             more_extreme = (
                 (fx.ftype == FractalType.TOP and fx.extreme > anchor.extreme)
                 or (fx.ftype == FractalType.BOTTOM and fx.extreme < anchor.extreme)
             )
             if more_extreme:
-                # 若 anchor 是上一笔的终点 → 上一笔需要撤回，因为终点不再是它
+                # 若 anchor 是上一笔的终点 → 上一笔的终点要替换成 fx，
+                # 即"上一笔的起点 → fx" 才是真正的那一笔。
+                # 实现方式：撤回上一笔，用 popped.start_fx 与 fx 配对重建。
                 if strokes and strokes[-1].end_fx is anchor:
                     popped = strokes.pop()
-                    # 撤回后新 anchor 应回到上一笔的起点 → 由 fx 再去与之配对
-                    anchor = popped.start_fx
-                    # 不立刻 continue：让 fx 走一次主循环，可能与新 anchor 成笔
-                    # 但本轮的 fx 与新 anchor 仍同性质（笔起点和终点必反），
-                    # 实际上不会同性质——这分支不会出现。安全起见仍走完。
-                anchor = fx
+                    new_start = popped.start_fx
+                    if _fractal_pair_valid(merged, new_start, fx, new_stroke):
+                        direction = (Direction.UP if new_start.ftype == FractalType.BOTTOM
+                                     else Direction.DOWN)
+                        strokes.append(Stroke(
+                            idx=len(strokes),
+                            direction=direction,
+                            start_fx=new_start,
+                            end_fx=fx,
+                        ))
+                        anchor = fx
+                    else:
+                        # 重建配对失败（极少见，例如 mid_idx 相邻）→ 回退
+                        # 让 popped.start_fx 充当新 anchor，等下一个异性 fx
+                        anchor = new_start
+                else:
+                    # 无上一笔可撤 → 仅替换 anchor（原先逻辑）
+                    anchor = fx
             # else: 丢弃 fx
             continue
 
         # 情况 B：fx 与 anchor 异性质但 _fractal_pair_valid 不通过（K线不够等）
         #   → 直接丢弃 fx（第77课"中间那些都 X 掉"的精神）。
-        # （未来如需更精细，可在此插入"特殊处理"。）
 
     return strokes
 
