@@ -3,21 +3,22 @@ chanlun_backtest.py
 ────────────────────────────────────
 缠论 1/2/3 类买卖点回测：评估 B1/B2/B3/S1/S2/S3 信号的前瞻收益。
 
-⚠️ Snapshot 模式：pipeline 一次跑完全历史，存在轻微"未来函数"——
-   线段/中枢的回溯确认会让历史信号在算法里比真实可见的早几根。
-   结果偏乐观。严格 walk-forward 需要按日重跑（约慢 100x），后续按需添加。
+两种模式：
+  snapshot   (默认) 一次性跑全历史 pipeline；偏乐观但快
+  walkforward 按日重跑 pipeline，只记录首次出现的信号；诚实但慢
 
 用法：
-  python chanlun_backtest.py                       # 默认 100 只 × ~3 年
-  CB_SAMPLE=300 CB_DAYS=1500 python chanlun_backtest.py
+  python chanlun_backtest.py                       # snapshot 模式
+  CB_MODE=walkforward python chanlun_backtest.py   # walk-forward
 环境变量：
-  CB_SAMPLE   覆盖前 N 只成交额最高的票  (default 100)
-  CB_DAYS     拉取多少日历日的历史        (default 1500)
-  CB_WORKERS  并发取数线程                (default 1; mini_racer 在多线程下会崩)
-  CB_HOLD     前瞻持仓周期，逗号分隔      (default 5,10,20)
-  CB_ZERO     1=严格 0 轴判定背驰；0=宽松 (default 0)
-  CB_CODES    直接指定股票代码 (逗号分隔)，跳过 spot 取池
-              例：CB_CODES=600519,000001,002594
+  CB_MODE     snapshot | walkforward             (default snapshot)
+  CB_SAMPLE   覆盖前 N 只成交额最高的票           (default 100)
+  CB_DAYS     拉取多少日历日的历史                (default 1500)
+  CB_WORKERS  并发取数线程                        (default 1; mini_racer 多线程会崩)
+  CB_HOLD     前瞻持仓周期，逗号分隔              (default 5,10,20)
+  CB_ZERO     1=严格 0 轴判定背驰；0=宽松         (default 0)
+  CB_CODES    直接指定股票代码 (逗号分隔)
+  CB_STEP     walk-forward 推进步长 (天)         (default 1)
 """
 
 from __future__ import annotations
@@ -47,12 +48,18 @@ def chanlun_backtest(sample_size: int = 100,
                      hold_days=(5, 10, 20),
                      workers: int = 8,
                      require_zero_axis: bool = False,
-                     codes: list[str] | None = None) -> pd.DataFrame:
+                     codes: list[str] | None = None,
+                     mode: str = "snapshot",
+                     wf_step: int = 1) -> pd.DataFrame:
     """
     返回长表 DataFrame，每行一个 (股票, 信号) 记录，含 +5d/+10d/+20d 收益。
     codes 不为空时跳过 get_universe，直接用指定代码列表。
+    mode='walkforward' 时按日重跑 pipeline，入场=检测日次日开盘（更诚实）。
     """
-    print(f"▶ 缠论回测 (snapshot): 历史 {period_days} 日")
+    mode_tag = "walk-forward" if mode == "walkforward" else "snapshot"
+    print(f"▶ 缠论回测 ({mode_tag}): 历史 {period_days} 日")
+    if mode == "walkforward":
+        print(f"  推进步长: 每 {wf_step} 个交易日重跑一次 pipeline")
     if require_zero_axis:
         print("  背驰判定: 严格 0 轴模式")
 
@@ -77,13 +84,21 @@ def chanlun_backtest(sample_size: int = 100,
 
     all_trades: list[dict] = []
     no_signal_count = 0
-    for code, hist in histories.items():
-        trades = _evaluate_one(code, name_map.get(code, ""), hist,
-                               hold_days, require_zero_axis)
+    for i, (code, hist) in enumerate(histories.items(), start=1):
+        if mode == "walkforward":
+            trades = _evaluate_one_walkforward(
+                code, name_map.get(code, ""), hist,
+                hold_days, require_zero_axis, wf_step,
+            )
+        else:
+            trades = _evaluate_one(code, name_map.get(code, ""), hist,
+                                   hold_days, require_zero_axis)
         if trades:
             all_trades.extend(trades)
         else:
             no_signal_count += 1
+        if mode == "walkforward" and i % 5 == 0:
+            print(f"   ...回测进度 {i}/{len(histories)} (累计信号 {len(all_trades)})")
 
     print(f"📊 出信号 {len(histories) - no_signal_count} 只；无信号 {no_signal_count} 只")
     return pd.DataFrame(all_trades)
@@ -185,6 +200,91 @@ def _evaluate_one(code: str, name: str, hist: pd.DataFrame,
     return trades
 
 
+def _evaluate_one_walkforward(code: str, name: str, hist: pd.DataFrame,
+                              hold_days, require_zero_axis: bool,
+                              step: int = 1) -> list[dict]:
+    """
+    Walk-forward：按日推进 pipeline，只记录"首次出现"的信号。
+    入场 = 检测日（T）的次日开盘，更贴近真实可操作场景。
+
+    步骤：
+      - warmup=80 根开始可信
+      - 每 step 天跑一次 pipeline on hist[:T+1]
+      - 对 signal not in seen: 记录 + 计算 T+1 入场后的 +N 日收益
+    """
+    if len(hist) < 100:
+        return []
+
+    warmup = 80
+    horizon = max(hold_days)
+    n = len(hist)
+    if n < warmup + horizon + 5:
+        return []
+
+    date_to_idx = {str(d): i for i, d in enumerate(hist["日期"])}
+    seen: set[tuple[str, str]] = set()
+    trades: list[dict] = []
+
+    for T in range(warmup, n - horizon, step):
+        hist_T = hist.iloc[:T + 1].reset_index(drop=True)
+        try:
+            raws = from_dataframe(hist_T)
+            merged = merge_klines(raws)
+            fxs = find_fractals(merged)
+            strokes = find_strokes(merged, fxs, new_stroke=True)
+            segments = find_segments(strokes)
+            if len(segments) < 3:
+                continue
+            pivots = find_pivots(segments)
+            divs = detect_divergence(segments, merged, raws,
+                                     require_zero_axis=require_zero_axis)
+            signals = find_signals(segments, pivots, divs)
+        except Exception:
+            continue
+
+        T_date = str(hist.iloc[T]["日期"])
+        entry_idx = T + 1
+        if entry_idx >= n:
+            continue
+        entry = float(hist.iloc[entry_idx]["开盘"])
+        if entry <= 0:
+            continue
+        entry_date = str(hist.iloc[entry_idx]["日期"])
+
+        for sig in signals:
+            key = (sig.signal_type, str(sig.dt))
+            if key in seen:
+                continue
+            sig_idx = date_to_idx.get(str(sig.dt))
+            if sig_idx is None or sig_idx > T:
+                continue   # 防御：信号日期不应超出 T
+            seen.add(key)
+
+            rec = {
+                "代码": code,
+                "名称": name,
+                "信号类型": sig.signal_type,
+                "买卖": "买" if sig.is_buy else "卖",
+                "信号日期": sig.dt,
+                "检测日期": T_date,
+                "检测延迟": T - sig_idx,
+                "入场日期": entry_date,
+                "信号价": round(sig.price, 2),
+                "入场价": round(entry, 2),
+                "备注": sig.note,
+            }
+            for n_h in hold_days:
+                tgt = entry_idx + n_h
+                if tgt < n:
+                    exit_p = float(hist.iloc[tgt]["收盘"])
+                    rec[f"+{n_h}d收益%"] = round((exit_p - entry) / entry * 100, 2)
+                else:
+                    rec[f"+{n_h}d收益%"] = None
+            trades.append(rec)
+
+    return trades
+
+
 def _fetch_histories(codes, period_days, workers):
     """并发预拉。日历日 → 取数窗口。"""
     start_date = (datetime.now() - timedelta(days=int(period_days * 1.5))).strftime("%Y%m%d")
@@ -232,13 +332,15 @@ def main():
     require_zero_axis = os.environ.get("CB_ZERO", "0") == "1"
     codes_env = os.environ.get("CB_CODES", "").strip()
     codes = [c.strip() for c in codes_env.split(",") if c.strip()] if codes_env else None
+    mode = os.environ.get("CB_MODE", "snapshot")
+    wf_step = int(os.environ.get("CB_STEP", 1))
 
     print(f"=== 缠论回测 {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
     trades = chanlun_backtest(
         sample_size=sample_size, period_days=period_days,
         hold_days=hold_days, workers=workers,
         require_zero_axis=require_zero_axis,
-        codes=codes,
+        codes=codes, mode=mode, wf_step=wf_step,
     )
 
     if trades.empty:
