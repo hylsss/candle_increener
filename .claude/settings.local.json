@@ -18,7 +18,8 @@
       "Bash(python tests/smoke_real_stock.py 000001)",
       "Bash(python tests/smoke_real_stock.py 002594)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(python -c ' *)"
     ]
   }
 }

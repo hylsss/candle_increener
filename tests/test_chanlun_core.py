@@ -19,9 +19,9 @@ import unittest
 
 from chanlun_core import (
     RawBar, MergedBar, Direction, FractalType,
-    Fractal, Stroke, Segment, Pivot, MACDPoint, Divergence,
+    Fractal, Stroke, Segment, Pivot, MACDPoint, Divergence, TradeSignal,
     merge_klines, find_fractals, find_strokes, find_segments, find_pivots,
-    calc_macd, segment_macd_area, detect_divergence,
+    calc_macd, segment_macd_area, detect_divergence, find_signals,
 )
 
 
@@ -851,6 +851,180 @@ class TestDetectDivergence(unittest.TestCase):
                                    require_zero_axis=True)
         # 严格模式不会比宽松模式更多结果
         self.assertLessEqual(len(strict), len(loose))
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 7. 1/2/3 类买卖点
+# ══════════════════════════════════════════════════════════════════════
+
+def _mk_div(direction: Direction, seg_a_idx: int, seg_c_idx: int,
+            price_a: float, price_c: float,
+            area_a: float = 10.0, area_c: float = 3.0) -> Divergence:
+    """便捷构造 Divergence。"""
+    return Divergence(
+        seg_a_idx=seg_a_idx, seg_c_idx=seg_c_idx,
+        direction=direction,
+        area_a=area_a, area_c=area_c,
+        price_a=price_a, price_c=price_c,
+        diff_a=1.0 if direction == Direction.UP else -1.0,
+        diff_c=0.5 if direction == Direction.UP else -0.5,
+    )
+
+
+class TestFindSignals(unittest.TestCase):
+
+    def test_no_inputs(self):
+        self.assertEqual(find_signals([], [], []), [])
+
+    def test_b1_from_down_divergence(self):
+        """DOWN 段背驰 → B1 信号在 C 段末端。"""
+        segs = _mk_segments([(30, 20), (20, 25), (25, 18)])
+        div = _mk_div(Direction.DOWN, seg_a_idx=0, seg_c_idx=2,
+                      price_a=20, price_c=18)
+        signals = find_signals(segs, [], [div])
+        b1 = [s for s in signals if s.signal_type == "B1"]
+        self.assertEqual(len(b1), 1)
+        self.assertAlmostEqual(b1[0].price, 18.0)
+        self.assertEqual(b1[0].segment_idx, 2)
+        self.assertIs(b1[0].divergence, div)
+
+    def test_s1_from_up_divergence(self):
+        """UP 段背驰 → S1 信号在 C 段末端。"""
+        segs = _mk_segments([(10, 25), (25, 18), (18, 28)])
+        div = _mk_div(Direction.UP, 0, 2, price_a=25, price_c=28)
+        signals = find_signals(segs, [], [div])
+        s1 = [s for s in signals if s.signal_type == "S1"]
+        self.assertEqual(len(s1), 1)
+        self.assertAlmostEqual(s1[0].price, 28.0)
+
+    def test_b2_after_b1_if_pullback_holds(self):
+        """B1 后 +1段 UP +2段 DOWN，DOWN 不破 B1 价 → 出 B2。"""
+        # seg0 DOWN, seg2 DOWN（背驰），seg3 UP，seg4 DOWN 回试不破
+        segs = _mk_segments([
+            (30, 20),     # s0 DOWN
+            (20, 25),     # s1 UP
+            (25, 18),     # s2 DOWN (B1)
+            (18, 23),     # s3 UP（次级别反弹）
+            (23, 19),     # s4 DOWN 回试，19 > 18 → B2
+        ])
+        div = _mk_div(Direction.DOWN, 0, 2, 20, 18)
+        signals = find_signals(segs, [], [div])
+        b2 = [s for s in signals if s.signal_type == "B2"]
+        self.assertEqual(len(b2), 1)
+        self.assertAlmostEqual(b2[0].price, 19.0)
+        self.assertEqual(b2[0].segment_idx, 4)
+
+    def test_b2_not_emitted_when_pullback_breaks(self):
+        """B1 后回试破 B1 价 → 不出 B2。"""
+        segs = _mk_segments([
+            (30, 20), (20, 25), (25, 18),
+            (18, 23),
+            (23, 17),     # 17 < 18 → 不出 B2
+        ])
+        div = _mk_div(Direction.DOWN, 0, 2, 20, 18)
+        signals = find_signals(segs, [], [div])
+        self.assertEqual([s for s in signals if s.signal_type == "B2"], [])
+
+    def test_s2_after_s1_if_bounce_caps(self):
+        """S1 后 +1段 DOWN +2段 UP，UP 不破 S1 价 → 出 S2。"""
+        segs = _mk_segments([
+            (10, 25), (25, 18), (18, 28),    # s2 是 S1（UP 背驰）
+            (28, 22),                         # s3 DOWN
+            (22, 27),                         # s4 UP，27 < 28 → S2
+        ])
+        div = _mk_div(Direction.UP, 0, 2, 25, 28)
+        signals = find_signals(segs, [], [div])
+        s2 = [s for s in signals if s.signal_type == "S2"]
+        self.assertEqual(len(s2), 1)
+        self.assertAlmostEqual(s2[0].price, 27.0)
+
+    def test_b3_requires_leaving_up(self):
+        """
+        leaving 方向必须是 UP 才能出 B3。
+        本构造的 leaving 是 DOWN，所以 find_signals 不应产出 B3。
+        """
+        segs = _mk_segments([
+            (10, 20), (20, 15), (15, 18),    # 中枢 [15,18]
+            (18, 16), (16, 25),              # 延伸纳入
+            (25, 22),                        # leaving DOWN (low=22>ZG=18)
+            (22, 26),
+        ])
+        pivots = find_pivots(segs)
+        self.assertGreaterEqual(len(pivots), 1)
+        signals = find_signals(segs, pivots, [])
+        self.assertEqual([s for s in signals if s.signal_type == "B3"], [])
+
+    def test_b3_with_up_leaving_and_holding_retest(self):
+        """
+        手工构造 Pivot + Segments，让 leaving 方向 = UP 且回试 DOWN 段
+        终点 > ZG → 输出 B3。
+        """
+        # 中枢 [15,18]；leaving 段（idx=3）UP，从 19 涨到 25；回试段（idx=4）DOWN
+        seg0 = _mk_segment(0, 10, 20)
+        seg1 = _mk_segment(1, 20, 15)
+        seg2 = _mk_segment(2, 15, 18)
+        seg3 = _mk_segment(3, 19, 25)   # leaving: UP, low=19 > ZG=18
+        seg4 = _mk_segment(4, 25, 20)   # 回试 DOWN, end=20 > ZG=18 → B3
+        segs = [seg0, seg1, seg2, seg3, seg4]
+        pivot = Pivot(
+            idx=0, segments=[seg0, seg1, seg2],
+            zg=18.0, zd=15.0, gg=20.0, dd=10.0,
+            entry_direction=None, leaving_segment=seg3,
+        )
+        signals = find_signals(segs, [pivot], [])
+        b3 = [s for s in signals if s.signal_type == "B3"]
+        self.assertEqual(len(b3), 1)
+        self.assertAlmostEqual(b3[0].price, 20.0)
+        self.assertEqual(b3[0].pivot_idx, 0)
+        self.assertEqual(b3[0].segment_idx, 4)
+
+    def test_b3_not_emitted_if_retest_breaks_zg(self):
+        """回试段终点 ≤ ZG → 不出 B3。"""
+        seg0 = _mk_segment(0, 10, 20)
+        seg1 = _mk_segment(1, 20, 15)
+        seg2 = _mk_segment(2, 15, 18)
+        seg3 = _mk_segment(3, 19, 25)
+        seg4 = _mk_segment(4, 25, 17)    # 回试到 17 ≤ ZG=18 → 无 B3
+        segs = [seg0, seg1, seg2, seg3, seg4]
+        pivot = Pivot(
+            idx=0, segments=[seg0, seg1, seg2],
+            zg=18.0, zd=15.0, gg=20.0, dd=10.0,
+            entry_direction=None, leaving_segment=seg3,
+        )
+        signals = find_signals(segs, [pivot], [])
+        self.assertEqual([s for s in signals if s.signal_type == "B3"], [])
+
+    def test_s3_with_down_leaving_and_holding_retest(self):
+        """leaving 方向 = DOWN，回抽 UP 段终点 < ZD → S3。"""
+        # 中枢 [85,90]；leaving DOWN 80→70；回抽 UP 70→82 < ZD=85 → S3
+        seg0 = _mk_segment(0, 100, 85)
+        seg1 = _mk_segment(1, 85, 90)
+        seg2 = _mk_segment(2, 90, 85)
+        seg3 = _mk_segment(3, 80, 70)
+        seg4 = _mk_segment(4, 70, 82)
+        segs = [seg0, seg1, seg2, seg3, seg4]
+        pivot = Pivot(
+            idx=0, segments=[seg0, seg1, seg2],
+            zg=90.0, zd=85.0, gg=100.0, dd=70.0,
+            entry_direction=None, leaving_segment=seg3,
+        )
+        signals = find_signals(segs, [pivot], [])
+        s3 = [s for s in signals if s.signal_type == "S3"]
+        self.assertEqual(len(s3), 1)
+        self.assertAlmostEqual(s3[0].price, 82.0)
+        self.assertEqual(s3[0].pivot_idx, 0)
+
+    def test_signals_sorted_by_segment_idx(self):
+        """输出按 segment_idx 升序，idx 重新赋值连续。"""
+        segs = _mk_segments([
+            (30, 20), (20, 25), (25, 18),
+            (18, 23), (23, 19),
+        ])
+        div = _mk_div(Direction.DOWN, 0, 2, 20, 18)
+        signals = find_signals(segs, [], [div])
+        seg_idxs = [s.segment_idx for s in signals]
+        self.assertEqual(seg_idxs, sorted(seg_idxs))
+        self.assertEqual([s.idx for s in signals], list(range(len(signals))))
 
 
 if __name__ == "__main__":

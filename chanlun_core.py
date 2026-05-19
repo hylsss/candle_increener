@@ -13,7 +13,7 @@ CHANLUN_NOTES.md 中有完整引用，本文件每一步实现都标注对应课
   Phase 1.4  find_segments    ── 线段划分（第67/71/77/78课）         ✅
   Phase 1.5  find_pivots      ── 中枢识别（第17/20/29课）            ✅
   Phase 1.6  detect_divergence── MACD背驰（第24/25/27/50课）         ✅
-  Phase 1.7  find_signals     ── 1/2/3类买卖点                       🚧
+  Phase 1.7  find_signals     ── 1/2/3类买卖点（第17/20/24/53课）    ✅
 """
 
 from __future__ import annotations
@@ -1137,6 +1137,172 @@ def detect_divergence(segments: list[Segment],
         ))
 
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 7. 1/2/3 类买卖点 — 第17/20/24/27/53课
+# ══════════════════════════════════════════════════════════════════════
+#
+# 识别策略（在当前级别上，"次级别"用相邻段近似）：
+#
+#   B1 / S1（第1类）：来自背驰 C 段的终点
+#     - DOWN 方向背驰 → B1（下跌趋势/盘整背驰的终点 = 第一类买点）
+#     - UP   方向背驰 → S1
+#     - 严格意义需要"趋势背驰"（≥2 个同向中枢），本实现先输出所有段级
+#       背驰对应的 1 类信号，并附带 divergence 引用供后续过滤
+#
+#   B2 / S2（第2类）：1 类后的次级别确认（第17课"买卖点定律一"）
+#     - B2：B1 之后，下一段（UP）完成、再下一段（DOWN）回试且不破 B1 价位
+#     - S2 镜像
+#     - 信号点 = 那条 DOWN 段（或 UP 段）的终点
+#
+#   B3 / S3（第3类）：中枢离开后的回试不破 ZG/ZD（第20/53课）
+#     - B3：已完成中枢的 leaving_segment 方向 = UP，且 leaving 之后的下
+#           一段（DOWN 反向回试）low > ZG → 第一类买点
+#     - S3 镜像，要求 high < ZD
+#     - "必须是第一次"：算法只看 leaving 后紧邻的那一段，自然成立
+#
+# 关于"是否前向中枢"等更高阶约束（第29/53课的趋势/盘整背驰区分等）暂
+# 不在此实现内细分，避免过度判定。可在调用层结合 pivots 数量/方向再做
+# 二次筛选。
+# ══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class TradeSignal:
+    """
+    一个买卖点信号。
+
+      signal_type  "B1"/"B2"/"B3"/"S1"/"S2"/"S3"
+      dt           信号点对应的日期
+      price        信号点价格（段末分型的 extreme）
+      segment_idx  信号点所在段在 segments 列表中的下标
+      pivot_idx    关联中枢下标（仅 B3/S3 有）；其他类型为 None
+      divergence   关联背驰记录（仅 B1/S1 有）；其他为 None
+      note         调试备注，可选
+    """
+    idx: int
+    signal_type: str
+    dt: str
+    price: float
+    segment_idx: int
+    pivot_idx: int | None = None
+    divergence: Divergence | None = None
+    note: str = ""
+
+    @property
+    def is_buy(self) -> bool:
+        return self.signal_type.startswith("B")
+
+    @property
+    def is_sell(self) -> bool:
+        return self.signal_type.startswith("S")
+
+    @property
+    def level(self) -> int:
+        """1, 2, 或 3。"""
+        return int(self.signal_type[1])
+
+
+def find_signals(segments: list[Segment],
+                 pivots: list[Pivot],
+                 divergences: list[Divergence]) -> list[TradeSignal]:
+    """
+    依据已识别的线段、中枢、背驰，统一输出 1/2/3 类买卖点。
+
+    返回的 TradeSignal 列表按 segment_idx 升序排列。idx 字段在最终排序后
+    重新赋值，保证可作为稳定外部引用。
+    """
+    signals: list[TradeSignal] = []
+    n_seg = len(segments)
+
+    # ── 1 类：来自 detect_divergence ─────────────────────────────
+    for div in divergences:
+        seg_c = segments[div.seg_c_idx]
+        sig_type = "S1" if div.direction == Direction.UP else "B1"
+        signals.append(TradeSignal(
+            idx=0,
+            signal_type=sig_type,
+            dt=seg_c.end_fx.dt,
+            price=seg_c.end_price,
+            segment_idx=div.seg_c_idx,
+            divergence=div,
+            note=f"area C/A={div.ratio:.0%}",
+        ))
+
+        # ── 2 类：1 类后 +2 段回试不破 1 类价位 ───────────────
+        # 段交替方向：c_idx 是 C 段，c_idx+1 反向，c_idx+2 与 C 同向
+        c_idx = div.seg_c_idx
+        if c_idx + 2 >= n_seg:
+            continue
+        seg_next = segments[c_idx + 1]
+        seg_after = segments[c_idx + 2]
+
+        if sig_type == "B1":
+            # B1 的 C 段是 DOWN（创新低背驰）；之后 UP-DOWN 回试
+            if (seg_next.direction == Direction.UP
+                    and seg_after.direction == Direction.DOWN
+                    and seg_after.end_price > seg_c.end_price):
+                signals.append(TradeSignal(
+                    idx=0, signal_type="B2",
+                    dt=seg_after.end_fx.dt,
+                    price=seg_after.end_price,
+                    segment_idx=c_idx + 2,
+                    note=f"after B1@{seg_c.end_fx.dt}",
+                ))
+        else:  # S1
+            if (seg_next.direction == Direction.DOWN
+                    and seg_after.direction == Direction.UP
+                    and seg_after.end_price < seg_c.end_price):
+                signals.append(TradeSignal(
+                    idx=0, signal_type="S2",
+                    dt=seg_after.end_fx.dt,
+                    price=seg_after.end_price,
+                    segment_idx=c_idx + 2,
+                    note=f"after S1@{seg_c.end_fx.dt}",
+                ))
+
+    # ── 3 类：中枢已完成 + 离开段方向匹配 + 紧邻回试不破 ZG/ZD ────
+    for p in pivots:
+        if p.leaving_segment is None:
+            continue
+        leaving = p.leaving_segment
+        leave_idx = leaving.idx
+        if leave_idx + 1 >= n_seg:
+            continue
+        retest = segments[leave_idx + 1]
+        # 段方向严格交替，retest 必与 leaving 反向 → 这里只做防御
+        if retest.direction == leaving.direction:
+            continue
+
+        if leaving.direction == Direction.UP:
+            # 中枢向上离开 → 等回试 DOWN 段低点是否 > ZG
+            if retest.end_price > p.zg:
+                signals.append(TradeSignal(
+                    idx=0, signal_type="B3",
+                    dt=retest.end_fx.dt,
+                    price=retest.end_price,
+                    segment_idx=leave_idx + 1,
+                    pivot_idx=p.idx,
+                    note=f"ZG={p.zg:.2f}",
+                ))
+        else:
+            # 中枢向下离开 → 等回抽 UP 段高点是否 < ZD
+            if retest.end_price < p.zd:
+                signals.append(TradeSignal(
+                    idx=0, signal_type="S3",
+                    dt=retest.end_fx.dt,
+                    price=retest.end_price,
+                    segment_idx=leave_idx + 1,
+                    pivot_idx=p.idx,
+                    note=f"ZD={p.zd:.2f}",
+                ))
+
+    # 按时间（segment_idx）稳定排序；同段位 1/2/3 类按级别次序输出
+    signals.sort(key=lambda s: (s.segment_idx, s.level))
+    for i, s in enumerate(signals):
+        s.idx = i
+    return signals
 
 
 # ══════════════════════════════════════════════════════════════════════

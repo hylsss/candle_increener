@@ -17,7 +17,7 @@ import akshare as ak
 from chanlun_core import (
     Direction, FractalType,
     from_dataframe, merge_klines, find_fractals, find_strokes,
-    find_segments, find_pivots, detect_divergence,
+    find_segments, find_pivots, detect_divergence, find_signals,
 )
 
 
@@ -122,6 +122,16 @@ def main(code: str = "600519"):
               f"{d.price_c:.2f}")
         print(f"        面积 {d.area_a:.4f} → {d.area_c:.4f} "
               f"(C/A={d.ratio:.2%})  DIFF极值 {d.diff_a:+.4f} → {d.diff_c:+.4f}")
+
+    # 1/2/3 类买卖点
+    print()
+    signals = find_signals(segments, pivots, divs)
+    buys = [s for s in signals if s.is_buy]
+    sells = [s for s in signals if s.is_sell]
+    print(f"  买卖点 {len(signals)}（买 {len(buys)} / 卖 {len(sells)}）")
+    for s in signals[-8:]:
+        tag = "买" if s.is_buy else "卖"
+        print(f"    [{s.signal_type}/{tag}] {s.dt}  {s.price:.2f}  {s.note}")
 
 
 if __name__ == "__main__":
