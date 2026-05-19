@@ -19,7 +19,17 @@
       "Bash(python tests/smoke_real_stock.py 002594)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import matplotlib; print\\('mpl', matplotlib.__version__\\)\")",
+      "Bash(CB_SAMPLE=20 CB_DAYS=1200 CB_WORKERS=6 python chanlun_backtest.py)",
+      "Bash(CB_SAMPLE=20 CB_DAYS=1200 CB_WORKERS=2 python chanlun_backtest.py)",
+      "Bash(CB_CODES=600519,000001,002594,600036,000333,600276,601318,000858,600887,300750 CB_DAYS=1500 CB_WORKERS=3 python chanlun_backtest.py)",
+      "Bash(CB_CODES=600519,000001,002594,600036 CB_DAYS=1500 CB_WORKERS=1 python chanlun_backtest.py)",
+      "Bash(python chanlun_viz.py 000001 --days 1500 --no-show --out /tmp/chanlun_000001.png)",
+      "Bash(python chanlun_viz.py 000001 --days 400 --no-show --out /tmp/chanlun_000001_short.png)",
+      "Bash(python chanlun_viz.py 600519 --days 600 --no-show --out /tmp/chanlun_600519.png)",
+      "Bash(python chanlun_viz.py 002594 --days 600 --no-show --out /tmp/chanlun_002594.png)",
+      "Bash(CB_CODES=600519,000001,002594,600036,000333,600276,601318,000858,600887,300750,601398,000725,600028,601628,601166,002475,300059,002241,600585,600009 CB_DAYS=1500 CB_WORKERS=1 python chanlun_backtest.py)"
     ]
   }
 }
