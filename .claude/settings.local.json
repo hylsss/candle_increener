@@ -12,7 +12,10 @@
       "Bash(python -c \"import akshare; print\\(akshare.__version__\\)\")",
       "Bash(python -m unittest tests.test_chanlun_core -v)",
       "Bash(python tests/smoke_real_stock.py 600519)",
-      "Bash(python -c \"import sys; [print\\(l\\) for l in sys.stdin]\")"
+      "Bash(python -c \"import sys; [print\\(l\\) for l in sys.stdin]\")",
+      "Bash(python -m pytest tests/test_chanlun_core.py -v)",
+      "Bash(python -c \"from chanlun_core import find_pivots, Pivot; print\\('ok', Pivot\\)\")",
+      "Bash(python tests/smoke_real_stock.py 000001)"
     ]
   }
 }

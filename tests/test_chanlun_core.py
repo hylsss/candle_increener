@@ -1,5 +1,5 @@
 """
-单元测试：chanlun_core 第1-3层（合并 / 分型 / 笔）
+单元测试：chanlun_core 第1-5层（合并 / 分型 / 笔 / 线段 / 中枢）
 
 测试用例的设计原则：
   - 每组数据都对应 CHANLUN_NOTES.md 里某条原文规则；
@@ -19,8 +19,8 @@ import unittest
 
 from chanlun_core import (
     RawBar, MergedBar, Direction, FractalType,
-    Fractal, Stroke, Segment,
-    merge_klines, find_fractals, find_strokes, find_segments,
+    Fractal, Stroke, Segment, Pivot,
+    merge_klines, find_fractals, find_strokes, find_segments, find_pivots,
 )
 
 
@@ -435,6 +435,198 @@ class TestFindSegments(unittest.TestCase):
             for a, b in zip(segs[:-1], segs[1:]):
                 self.assertNotEqual(a.direction, b.direction,
                                     f"段{a.idx}{a.direction}与段{b.idx}{b.direction}方向相同")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 5. 中枢识别
+# ══════════════════════════════════════════════════════════════════════
+
+def _mk_segment(idx: int, start_price: float, end_price: float) -> Segment:
+    """
+    构造一段最小合规的 Segment：用一笔代表整段。
+    Segment 的 high/low/start_price/end_price 只依赖 start_fx/end_fx，
+    对中枢识别测试足矣（不依赖线段内部破坏类型等细节）。
+    """
+    stroke = _make_stroke(idx, start_price, end_price)
+    return Segment(idx=idx, direction=stroke.direction, strokes=[stroke])
+
+
+def _mk_segments(price_pairs):
+    """传入 [(start, end), (start, end), ...]，按序构造交替方向的段。"""
+    return [_mk_segment(i, sp, ep) for i, (sp, ep) in enumerate(price_pairs)]
+
+
+class TestFindPivots(unittest.TestCase):
+
+    def test_too_few_segments(self):
+        """线段 < 3 → 无中枢。"""
+        segs = _mk_segments([(10, 20), (20, 15)])
+        self.assertEqual(find_pivots(segs), [])
+
+    def test_basic_pivot(self):
+        """
+        三段构成最简中枢：
+          s0: UP 10→20     [10,20]
+          s1: DOWN 20→15   [15,20]
+          s2: UP 15→18     [15,18]
+        s0 与 s2 同向，重叠区间 = [max(10,15), min(20,18)] = [15,18] → 中枢 [15,18]
+        """
+        segs = _mk_segments([(10, 20), (20, 15), (15, 18)])
+        pivots = find_pivots(segs)
+        self.assertEqual(len(pivots), 1)
+        p = pivots[0]
+        self.assertAlmostEqual(p.zg, 18.0)
+        self.assertAlmostEqual(p.zd, 15.0)
+        self.assertAlmostEqual(p.gg, 20.0)   # max of all members' highs
+        self.assertAlmostEqual(p.dd, 10.0)   # min of all members' lows
+        self.assertEqual(len(p), 3)
+        self.assertIsNone(p.entry_direction)
+        self.assertIsNone(p.leaving_segment)
+        self.assertFalse(p.is_finished)
+
+    def test_no_overlap_no_pivot(self):
+        """
+        s0 与 s2 完全不重叠 → 不成中枢。
+        s0: UP 10→20，s1: DOWN 20→5，s2: UP 5→8
+        s0 [10,20] vs s2 [5,8]：min(s0.high, s2.high)=8 < max(s0.low, s2.low)=10。
+        """
+        segs = _mk_segments([(10, 20), (20, 5), (5, 8)])
+        self.assertEqual(find_pivots(segs), [])
+
+    def test_pivot_extension(self):
+        """
+        中枢延伸：第4段仍在 [ZD,ZG] 内，纳入中枢；GG/DD 可被新段刷新。
+          s0 UP   10→25    [10,25]
+          s1 DOWN 25→16    [16,25]
+          s2 UP   16→23    [16,23]
+          s3 DOWN 23→14    [14,23] —— low=14 已低于 ZD=16，但与 [16,23] 仍有交集
+                                    （high=23 >= ZD=16，low=14 <= ZG=23）→ 纳入
+          s4 UP   14→24    [14,24] —— 同理纳入，high=24 > ZG=23 但仍有交集
+          → 共 5 段，DD 应被刷到 14，GG 刷到 25。
+        ZG = min(25, 23) = 23；ZD = max(10, 16) = 16。
+        """
+        segs = _mk_segments([
+            (10, 25), (25, 16), (16, 23),
+            (23, 14), (14, 24),
+        ])
+        pivots = find_pivots(segs)
+        self.assertEqual(len(pivots), 1)
+        p = pivots[0]
+        self.assertAlmostEqual(p.zg, 23.0)
+        self.assertAlmostEqual(p.zd, 16.0)
+        self.assertAlmostEqual(p.gg, 25.0)
+        self.assertAlmostEqual(p.dd, 10.0)
+        self.assertEqual(len(p), 5)
+        self.assertFalse(p.is_finished)
+
+    def test_pivot_leaving_up(self):
+        """
+        向上离开：第4段 low > ZG → leaving_segment，中枢结束。
+          s0 UP   10→20    [10,20]
+          s1 DOWN 20→15    [15,20]
+          s2 UP   15→18    [15,18]   ZG=18, ZD=15
+          s3 DOWN 18→16    [16,18]   仍在 [15,18] 内 → 纳入
+          s4 UP   16→25    [16,25]   low=16 ≤ ZG=18 → 仍有交集 → 纳入
+          s5 DOWN 25→22    [22,25]   low=22 > ZG=18 → 离开（leaving）
+        """
+        segs = _mk_segments([
+            (10, 20), (20, 15), (15, 18),
+            (18, 16), (16, 25), (25, 22),
+        ])
+        pivots = find_pivots(segs)
+        self.assertGreaterEqual(len(pivots), 1)
+        p = pivots[0]
+        self.assertAlmostEqual(p.zg, 18.0)
+        self.assertAlmostEqual(p.zd, 15.0)
+        self.assertEqual(len(p), 5)            # s0..s4 纳入
+        self.assertTrue(p.is_finished)
+        self.assertIsNotNone(p.leaving_segment)
+        self.assertEqual(p.leaving_segment.idx, 5)
+        self.assertEqual(p.leaving_segment.direction, Direction.DOWN)
+
+    def test_entry_direction_recorded(self):
+        """
+        中枢前若存在线段，entry_direction = 该段方向。
+        构造：让 s0 与 s2 不重叠（s0 区间高过 s2 整段），中枢只能从 s1 起。
+          s0 DOWN [100, 60]      —— 进入段，high=100，low=60
+          s1 UP   [40, 20]→等价 _mk_segment(1, 60, 40)：UP? 不，60→40 是 DOWN…
+        段方向由 start_price/end_price 决定。要让 s1 是 UP，必须 end>start。
+        但相邻段方向交替，s0=DOWN 之后 s1=UP，s1 必须从 s0 末端起。
+        这里我们用"逻辑上"独立的段（_mk_segment 不要求段端点连续）：
+          s0 DOWN 高位 100→60，s1 UP 5→20，s2 DOWN 20→15，s3 UP 15→18
+        s0 区间 [60,100]，s2 区间 [15,20]：min(s0.high, s2.high)=20，
+        max(s0.low, s2.low)=60 → 20 < 60 → 无重叠 → i=0 不成中枢。
+        i=1：s1 [5,20]，s3 [15,18]：ZG=min(20,18)=18，ZD=max(5,15)=15 → 中枢。
+        """
+        segs = _mk_segments([
+            (100, 60),      # s0 DOWN —— 进入段
+            (5, 20),        # s1 UP
+            (20, 15),       # s2 DOWN
+            (15, 18),       # s3 UP
+        ])
+        pivots = find_pivots(segs)
+        self.assertEqual(len(pivots), 1)
+        self.assertEqual(pivots[0].entry_direction, Direction.DOWN)
+        # 中枢从 s1 开始
+        self.assertEqual(pivots[0].segments[0].idx, 1)
+
+    def test_consecutive_pivots(self):
+        """
+        连续两个中枢：第一个被向上离开，离开段成为第二个中枢的第一段。
+          中枢1：s0/s1/s2 [15,18]，s3 仍在内，s4 也在内，s5 离开。
+          中枢2：从 s5 开始扫描，需要 s5、s6、s7 同向且 s5/s7 有重叠。
+        """
+        segs = _mk_segments([
+            (10, 20), (20, 15), (15, 18),       # 中枢1 起 [15,18]
+            (18, 16), (16, 25),                 # 延伸纳入
+            (25, 22),                           # 离开（高于 ZG=18）
+            (22, 30), (30, 24),                 # 中枢2 候选起：s6 UP, s7 DOWN
+        ])
+        pivots = find_pivots(segs)
+        # 第一个中枢应该存在并完成
+        self.assertGreaterEqual(len(pivots), 1)
+        p1 = pivots[0]
+        self.assertTrue(p1.is_finished)
+        self.assertAlmostEqual(p1.zg, 18.0)
+        self.assertAlmostEqual(p1.zd, 15.0)
+
+        # 若线段足够形成第二中枢，验证它的 entry_direction
+        if len(pivots) >= 2:
+            p2 = pivots[1]
+            # 第二中枢的"前一段"是中枢1 最后一段（s4 UP）或离开段（s5 DOWN）
+            self.assertIn(p2.entry_direction, (Direction.UP, Direction.DOWN))
+
+    def test_boundary_equality_not_leaving(self):
+        """
+        边界等值：sj.high == ZD 或 sj.low == ZG 都应仍算"有交集"。
+        本实现脱离判定用严格不等：sj.low > zg or sj.high < zd。
+        构造：中枢 [15, 18]，s3 = DOWN 18→12（high=18=ZG）→ 应纳入。
+        GG/DD 取所有成员段的极值，含 s0 的 low=10。
+        """
+        segs = _mk_segments([
+            (10, 20), (20, 15), (15, 18),    # 中枢 ZG=18 ZD=15
+            (18, 12),                        # s3 DOWN, high=18=ZG → 有交集
+        ])
+        pivots = find_pivots(segs)
+        self.assertEqual(len(pivots), 1)
+        p = pivots[0]
+        self.assertEqual(len(p), 4)
+        self.assertAlmostEqual(p.zg, 18.0)
+        self.assertAlmostEqual(p.zd, 15.0)
+        # GG/DD 是所有成员段的极值包络
+        self.assertAlmostEqual(p.gg, 20.0)   # 最高来自 s0/s1
+        self.assertAlmostEqual(p.dd, 10.0)   # 最低来自 s0
+
+    def test_gg_dd_envelope_exceeds_pivot_range(self):
+        """
+        GG/DD 是震荡包络，可以超出 [ZD, ZG] 边界。
+        这是缠论原意：进入段、扩展段的端点可能在 ZG 之上或 ZD 之下。
+        """
+        # ZG=18, ZD=15, 但 s0 的低点 10 远低于 ZD
+        segs = _mk_segments([(10, 20), (20, 15), (15, 18)])
+        p = find_pivots(segs)[0]
+        self.assertLess(p.dd, p.zd)          # 10 < 15
+        self.assertGreater(p.gg, p.zg)       # 20 > 18
 
 
 if __name__ == "__main__":

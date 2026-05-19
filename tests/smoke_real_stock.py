@@ -16,7 +16,8 @@ import akshare as ak
 
 from chanlun_core import (
     Direction, FractalType,
-    from_dataframe, merge_klines, find_fractals, find_strokes, find_segments,
+    from_dataframe, merge_klines, find_fractals, find_strokes,
+    find_segments, find_pivots,
 )
 
 
@@ -91,6 +92,22 @@ def main(code: str = "600519"):
         print(f"    {arrow} {seg.start_fx.dt} {seg.start_price:.2f}"
               f" → {seg.end_fx.dt} {seg.end_price:.2f}"
               f"（{len(seg)}笔，{bt}）")
+
+    # 中枢：基于线段序列识别
+    print()
+    pivots = find_pivots(segments)
+    finished = sum(1 for p in pivots if p.is_finished)
+    print(f"  中枢 {len(pivots)}（已完成 {finished} / 未完成 {len(pivots) - finished}）")
+    for p in pivots[-5:]:
+        if p.entry_direction is None:
+            entry_tag = "—"
+        else:
+            entry_tag = "↑" if p.entry_direction == Direction.UP else "↓"
+        status = "已离开" if p.is_finished else "延伸中"
+        print(f"    [{entry_tag}进] {p.start_dt} → {p.end_dt}"
+              f"  [{p.zd:.2f}, {p.zg:.2f}]"
+              f"  DD/GG=[{p.dd:.2f}, {p.gg:.2f}]"
+              f"  {len(p)}段 {status}")
 
 
 if __name__ == "__main__":

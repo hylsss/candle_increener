@@ -11,7 +11,7 @@ CHANLUN_NOTES.md 中有完整引用，本文件每一步实现都标注对应课
   Phase 1.2  find_fractals    ── 顶/底分型识别（第62/77课）          ✅
   Phase 1.3  find_strokes     ── 笔的划分（第77课3步法）             ✅
   Phase 1.4  find_segments    ── 线段划分（第67/71/77/78课）         ✅
-  Phase 1.5  find_pivots      ── 中枢识别（第17/29课）               🚧
+  Phase 1.5  find_pivots      ── 中枢识别（第17/20/29课）            ✅
   Phase 1.6  detect_divergence── MACD背驰                            🚧
   Phase 1.7  find_signals     ── 1/2/3类买卖点                       🚧
 """
@@ -163,6 +163,60 @@ class Segment:
 
     def __len__(self) -> int:
         return len(self.strokes)
+
+
+@dataclass
+class Pivot:
+    """
+    中枢（第17/20/29课）。
+
+    segments       构成中枢的连续线段（不含 leaving_segment）。
+    zg / zd        中枢上沿 / 下沿。第20课公式：ZG=min(g1,g2)，ZD=max(d1,d2)，
+                   只用"前两段同向次级别走势"的高低点决定。本实现中线段在
+                   时间上自然交替方向，因此 g1/g2 取 segments[0] 与 segments[2]
+                   的 high；d1/d2 同理。"定中枢以后不再因后续 Z 段而改变"。
+    gg / dd        中枢震荡的最高 / 最低边界。GG=max(gn)，DD=min(dn)，遍历
+                   中枢中所有 Z 段（含 segments[0..]，本实现遍历全部成员段）。
+    entry_direction 进入中枢前一段线段的方向；UP=上升中枢、DOWN=下跌中枢。
+                   若中枢从序列开头开始（无前驱段），值为 None。
+    leaving_segment 离开中枢的那一段线段（首段满足 low>ZG 或 high<ZD）。
+                   未离开（中枢仍在延伸到序列末尾）时为 None。
+    """
+    idx: int
+    segments: list[Segment]
+    zg: float
+    zd: float
+    gg: float
+    dd: float
+    entry_direction: Direction | None = None
+    leaving_segment: Segment | None = None
+
+    @property
+    def high(self) -> float:
+        """中枢上沿（= ZG）。买卖点判定时所用的"硬边界"。"""
+        return self.zg
+
+    @property
+    def low(self) -> float:
+        """中枢下沿（= ZD）。"""
+        return self.zd
+
+    @property
+    def start_dt(self) -> str:
+        return self.segments[0].start_fx.dt
+
+    @property
+    def end_dt(self) -> str:
+        """中枢最后一段结束时间。若已有 leaving，则中枢边界仍取最后成员段。"""
+        return self.segments[-1].end_fx.dt
+
+    @property
+    def is_finished(self) -> bool:
+        """是否已出现离开段。"""
+        return self.leaving_segment is not None
+
+    def __len__(self) -> int:
+        return len(self.segments)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -775,6 +829,97 @@ def find_segments(strokes: list[Stroke]) -> list[Segment]:
             ))
 
     return segments
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 5. 中枢识别 — 第17/20/29课
+# ══════════════════════════════════════════════════════════════════════
+#
+# 算法（最低不可分级别下，"次级别走势"用线段近似）：
+#   ① 顺序扫描线段。对每个候选起点 i，考察 segments[i]、segments[i+1]、
+#      segments[i+2] 三段。由于线段在时间上严格交替方向，segments[i] 与
+#      segments[i+2] 必然同向，套用第20课公式：
+#          ZG = min(segments[i].high, segments[i+2].high)
+#          ZD = max(segments[i].low,  segments[i+2].low)
+#      若 ZG > ZD（前两同向段有重叠），中枢成立，前三段全部纳入。
+#   ② 向后扩展：对 j = i+3, i+4, ...，若 segments[j] 与 [ZD, ZG] 仍有
+#      交集（即 segments[j].low <= ZG 且 segments[j].high >= ZD），
+#      纳入并更新 GG=max(gn)、DD=min(dn)；否则该段就是 leaving_segment，
+#      中枢在 j-1 处结束。
+#   ③ 进入方向（entry_direction）取 segments[i-1].direction；i=0 时为 None。
+#   ④ 下一中枢的扫描从 leaving 段开始（i=j），允许"离开段"成为下一中枢的
+#      第一段（即趋势中两个同级别中枢之间共享一段过渡）。若无离开段（中枢
+#      延伸到序列末尾），算法结束。
+#
+# 第20课关键边界：
+#   - "ZD/ZG 只用前两段同向走势的高低点，定下后不再因后续 Z 段而改变"
+#   - "GG/DD 遍历所有 Z 段"——用于判断扩展、级别升级、第3类买卖点等
+#   - "若有 Zn，使得 dn>ZG 或 gn<ZD，则必然产生高级别的走势中枢或趋势"
+#     —— 本实现把这种 Zn 标为 leaving_segment，不计入当前中枢
+# ══════════════════════════════════════════════════════════════════════
+
+
+def find_pivots(segments: list[Segment]) -> list[Pivot]:
+    """
+    把线段序列划分成若干中枢。
+
+    返回 Pivot 列表，按时间顺序排列。最后一个中枢可能 is_finished=False
+    （仍在延伸/未出现离开段）。
+    """
+    if len(segments) < 3:
+        return []
+
+    pivots: list[Pivot] = []
+    i = 0
+    n = len(segments)
+
+    while i + 2 < n:
+        s1, s3 = segments[i], segments[i + 2]
+        # 第20课公式：仅用前两段同向走势确定中枢边界
+        zg = min(s1.high, s3.high)
+        zd = max(s1.low, s3.low)
+
+        if zg <= zd:
+            # 前两同向段无重叠 → 此处不成中枢，下一段开始扫描
+            i += 1
+            continue
+
+        members: list[Segment] = list(segments[i:i + 3])
+        gg = max(s.high for s in members)
+        dd = min(s.low for s in members)
+
+        # 向后扩展：纳入与 [ZD, ZG] 有交集的段
+        leaving: Segment | None = None
+        j = i + 3
+        while j < n:
+            sj = segments[j]
+            # 完全脱离中枢区间 → 离开段
+            if sj.low > zg or sj.high < zd:
+                leaving = sj
+                break
+            members.append(sj)
+            if sj.high > gg:
+                gg = sj.high
+            if sj.low < dd:
+                dd = sj.low
+            j += 1
+
+        entry_dir = segments[i - 1].direction if i > 0 else None
+        pivots.append(Pivot(
+            idx=len(pivots),
+            segments=members,
+            zg=zg, zd=zd, gg=gg, dd=dd,
+            entry_direction=entry_dir,
+            leaving_segment=leaving,
+        ))
+
+        if leaving is None:
+            # 中枢延伸到序列末尾，没有更多段可处理
+            break
+        # 离开段允许作为下一中枢的"第一段"参与扫描
+        i = j
+
+    return pivots
 
 
 # ══════════════════════════════════════════════════════════════════════
