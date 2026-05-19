@@ -351,7 +351,8 @@ def main():
     print(trades["信号类型"].value_counts().sort_index().to_string())
 
     summary = chanlun_summary(trades, hold_days)
-    print(f"\n=== 📊 缠论回测汇总 (snapshot 模式) ===")
+    mode_tag = "walk-forward" if mode == "walkforward" else "snapshot"
+    print(f"\n=== 📊 缠论回测汇总 ({mode_tag} 模式) ===")
     print("注意: B 类胜率 = 正收益占比; S 类胜率 = 负收益占比 (信号后下跌为胜)")
     print(summary.to_string(index=False))
 
