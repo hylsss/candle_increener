@@ -7,7 +7,18 @@ local_patch.py
   ak.stock_zh_a_hist → ak.stock_zh_a_daily   (sina)
 
 经验证：本机 + Actions 都用 sina 才能稳定跑通；东财在两边都不可用。
+
+另外设全局 socket 超时下限：akshare 内部请求不传 timeout，网络抖动时
+单个请求会无限挂起、用 workers=1 时直接拖死整个扫描。设默认超时后，
+卡住的请求会在 N 秒抛错而非永久阻塞（可用 CB_HTTP_TIMEOUT 调整）。
 """
+
+import os
+import socket
+
+# 在任何网络请求前设好 socket 默认超时（连接 + 读取都受此约束）
+_HTTP_TIMEOUT = float(os.environ.get("CB_HTTP_TIMEOUT", "25"))
+socket.setdefaulttimeout(_HTTP_TIMEOUT)
 
 import akshare as ak
 import pandas as pd
