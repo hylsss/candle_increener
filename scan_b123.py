@@ -178,7 +178,8 @@ def _strict_trend_pivots(div, pivots) -> list:
 
 def _strict_signal_check(sig, signals, segments, pivots,
                          closes: np.ndarray, sig_idx: int,
-                         last_idx: int, max_age: int) -> tuple[bool, str, dict]:
+                         last_idx: int, max_age: int,
+                         current_price: float | None = None) -> tuple[bool, str, dict]:
     """按缠论定义做硬过滤；均线、量能不参与信号真伪判定。"""
     if last_idx - sig_idx > max_age:
         return False, "信号过旧", {}
@@ -193,7 +194,9 @@ def _strict_signal_check(sig, signals, segments, pivots,
     if any(s.is_sell and s.segment_idx > sig.segment_idx for s in signals):
         return False, "之后已出现同级别卖点", {}
 
-    cur = float(closes[-1])
+    cur = (float(current_price) if current_price is not None
+           and np.isfinite(current_price) and current_price > 0
+           else float(closes[-1]))
     context: dict = {"结构合规": True, "结构级别": "线段"}
 
     if sig.signal_type == "B1":
@@ -538,8 +541,13 @@ def _detect_b123(code: str, name: str, cur_price,
     closes = hist["收盘"].to_numpy(dtype=float)
     volumes = hist["成交量"].to_numpy(dtype=float) if "成交量" in hist.columns else None
 
-    # 当前状态
-    cur = float(closes[-1])
+    # 当前价使用实时股票池报价；历史日线仍只负责结构识别，避免把盘中未完成
+    # K线混入分型/笔/线段。实时行情不可用时才回退到最新日线收盘价。
+    try:
+        quote_price = float(cur_price)
+    except (TypeError, ValueError):
+        quote_price = float("nan")
+    cur = quote_price if np.isfinite(quote_price) and quote_price > 0 else float(closes[-1])
     cur_ma20 = float(closes[max(0, last_idx - 19):last_idx + 1].mean())
     cur_ma60 = float(closes[max(0, last_idx - 59):last_idx + 1].mean())
 
@@ -560,6 +568,7 @@ def _detect_b123(code: str, name: str, cur_price,
             ok, _, strict_context = _strict_signal_check(
                 sig, signals, segments, pivots, closes, sig_idx, last_idx,
                 max_age=lookback_days,
+                current_price=cur,
             )
             if not ok:
                 continue

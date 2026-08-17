@@ -68,6 +68,15 @@ class TestStrictSignalCheck(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("尚未", reason)
 
+    def test_realtime_price_controls_signal_invalidation(self):
+        """实时价已破买点时，不能被历史日线收盘价掩盖。"""
+        segments, pivots, sig = _downtrend_fixture()
+        ok, reason, _ = _strict_signal_check(
+            sig, [sig], segments, pivots, np.array([9.0]), 0, 0, 5,
+            current_price=7.5)
+        self.assertFalse(ok)
+        self.assertIn("当前价已跌破", reason)
+
     def test_b3_requires_completed_first_retest_above_zg(self):
         members = [_segment(0, 10, 20), _segment(1, 20, 15), _segment(2, 15, 18)]
         leaving = _segment(3, 19, 25)
