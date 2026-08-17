@@ -24,11 +24,12 @@ B1/B2/B3 信号且通过过滤条件的股票，按信号质量评分排列输�
 
 环境变量：
   B123_SAMPLE    扫描股票数（成交额排序）   default 300
-  B123_LOOKBACK  信号有效期（交易日）       default 30
+  B123_LOOKBACK  信号有效期（交易日）       default 5（严格模式）
   B123_DAYS      历史数据日历天数           default 800
   B123_TYPES     信号类型（逗号分隔）       default B2,B3
   B123_MIN_SCORE 最低质量分（0-100）        default 25
   B123_WORKERS   并发数                     default 1
+  B123_STRICT    =1 启用严格缠论硬过滤       default 1
   SPREADSHEET_ID Google Sheets ID
 """
 
@@ -54,6 +55,130 @@ from chanlun_core import (
     from_dataframe, merge_klines, find_fractals, find_strokes,
     find_segments, find_pivots, detect_divergence, find_signals,
 )
+
+
+def _pivot_end_idx(pivot) -> int:
+    return max(s.idx for s in pivot.segments)
+
+
+def _strict_trend_pivots(div, pivots) -> list:
+    """返回背驰 C 段之前、构成同向趋势的已完成中枢。
+
+    严格第一类买点的前提是趋势背驰，而不是任意相邻线段的 MACD
+    面积缩小。下跌趋势要求后中枢 GG < 前中枢 DD；上涨趋势镜像。
+    """
+    eligible = [
+        p for p in pivots
+        if p.is_finished and _pivot_end_idx(p) < div.seg_c_idx
+    ]
+    eligible.sort(key=lambda p: p.segments[0].idx)
+    trend = []
+    for p in eligible:
+        if not trend:
+            trend.append(p)
+            continue
+        prev = trend[-1]
+        separated = (
+            p.gg < prev.dd if div.direction == Direction.DOWN
+            else p.dd > prev.gg
+        )
+        if separated:
+            trend.append(p)
+        else:
+            # 中枢区间/波动区间重叠意味着扩展或盘整，不能冒充趋势。
+            trend = [p]
+    return trend
+
+
+def _strict_signal_check(sig, signals, segments, pivots,
+                         closes: np.ndarray, sig_idx: int,
+                         last_idx: int, max_age: int) -> tuple[bool, str, dict]:
+    """按缠论定义做硬过滤；均线、量能不参与信号真伪判定。"""
+    if last_idx - sig_idx > max_age:
+        return False, "信号过旧", {}
+    if sig.segment_idx >= len(segments):
+        return False, "信号线段不存在", {}
+
+    signal_seg = segments[sig.segment_idx]
+    if signal_seg.break_type == 0:
+        return False, "信号线段尚未被反向线段破坏确认", {}
+
+    # 买点之后若已有更晚的同级别卖点，买点已完成其生命周期。
+    if any(s.is_sell and s.segment_idx > sig.segment_idx for s in signals):
+        return False, "之后已出现同级别卖点", {}
+
+    cur = float(closes[-1])
+    context: dict = {"结构合规": True, "结构级别": "线段"}
+
+    if sig.signal_type == "B1":
+        div = sig.divergence
+        if div is None or div.direction != Direction.DOWN:
+            return False, "缺少下跌趋势背驰", {}
+        if div.diff_a >= 0:
+            return False, "第一类买点不在MACD零轴下方", {}
+        trend_pivots = _strict_trend_pivots(div, pivots)
+        if len(trend_pivots) < 2:
+            return False, "不足两个依次向下且不重叠的同级别中枢", {}
+        if cur < sig.price:
+            return False, "当前价已跌破第一类买点", {}
+        context.update({
+            "趋势中枢数": len(trend_pivots),
+            "背驰比(C/A)": round(div.ratio, 3),
+        })
+
+    elif sig.signal_type == "B2":
+        # 二买必须来自一个严格有效的一买，不能只凭“不创新低”命名。
+        parent = next((
+            s for s in signals
+            if s.signal_type == "B1" and s.segment_idx == sig.segment_idx - 2
+        ), None)
+        if parent is None or parent.divergence is None:
+            return False, "缺少对应第一类买点", {}
+        trend_pivots = _strict_trend_pivots(parent.divergence, pivots)
+        if len(trend_pivots) < 2 or parent.divergence.diff_a >= 0:
+            return False, "前置第一类买点不是严格趋势背驰", {}
+        rally = segments[sig.segment_idx - 1]
+        if rally.break_type == 0:
+            return False, "一买后的向上走势尚未完成", {}
+        if sig.price <= parent.price:
+            return False, "回试跌破第一类买点", {}
+        if cur < sig.price:
+            return False, "当前价已跌破第二类买点", {}
+        context.update({"前置B1价": round(parent.price, 2), "趋势中枢数": len(trend_pivots)})
+
+    elif sig.signal_type == "B3":
+        if sig.pivot_idx is None or sig.pivot_idx >= len(pivots):
+            return False, "缺少对应中枢", {}
+        pivot = pivots[sig.pivot_idx]
+        leaving = pivot.leaving_segment
+        if not pivot.is_finished or leaving is None:
+            return False, "中枢尚未完成离开", {}
+        if leaving.direction != Direction.UP or leaving.break_type == 0:
+            return False, "向上离开走势尚未完成", {}
+        if leaving.idx + 1 != sig.segment_idx:
+            return False, "不是离开中枢后的第一次回试", {}
+        if leaving.low <= pivot.zg:
+            return False, "离开走势未整体脱离中枢上沿", {}
+        if signal_seg.direction != Direction.DOWN or signal_seg.low <= pivot.zg:
+            return False, "回试跌破中枢上沿ZG", {}
+        if cur <= pivot.zg:
+            return False, "当前价已返回中枢", {}
+        context.update({"ZG": round(pivot.zg, 2), "ZD": round(pivot.zd, 2),
+                        "中枢段数": len(pivot.segments)})
+    else:
+        return False, "严格选股只接受B1/B2/B3", {}
+
+    return True, "", context
+
+
+def _strict_score(sig, context: dict) -> int:
+    """只用缠论结构信息排序，不把均线/黄金分割伪装成买点依据。"""
+    if sig.signal_type == "B1":
+        ratio = float(context.get("背驰比(C/A)", 1.0))
+        return max(60, min(100, round(105 - ratio * 50)))
+    if sig.signal_type == "B2":
+        return min(100, 80 + 5 * int(context.get("趋势中枢数", 2)))
+    return min(100, 75 + 4 * int(context.get("中枢段数", 3)))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -297,7 +422,8 @@ def _detect_b123(code: str, name: str, cur_price,
                  hist: pd.DataFrame,
                  lookback_days: int,
                  target_types: set[str],
-                 min_score: int) -> list[dict]:
+                 min_score: int,
+                 strict_mode: bool = True) -> list[dict]:
     """
     对单只股票跑完整 pipeline，返回近 lookback_days 内
     符合 target_types 且 score >= min_score 的信号记录列表。
@@ -315,7 +441,8 @@ def _detect_b123(code: str, name: str, cur_price,
         if len(segments) < 3:
             return []
         pivots = find_pivots(segments)
-        divs = detect_divergence(segments, merged, raws, require_zero_axis=False)
+        divs = detect_divergence(
+            segments, merged, raws, require_zero_axis=strict_mode)
         signals = find_signals(segments, pivots, divs)
     except Exception:
         return []
@@ -342,14 +469,24 @@ def _detect_b123(code: str, name: str, cur_price,
         if dist > lookback_days:
             continue
 
-        # 公共过滤：MA60 偏离（B1 放宽到 -15%，其余 -10%）
+        strict_context = {}
+        if strict_mode:
+            ok, _, strict_context = _strict_signal_check(
+                sig, signals, segments, pivots, closes, sig_idx, last_idx,
+                max_age=lookback_days,
+            )
+            if not ok:
+                continue
+
+        # 宽松兼容模式才使用均线/量能硬过滤；严格模式中它们不是缠论定义。
         ma60_at_sig = float(closes[max(0, sig_idx - 59):sig_idx + 1].mean())
         close_at_sig = float(closes[sig_idx])
         ma60_pct = round((close_at_sig - ma60_at_sig) / ma60_at_sig * 100, 1) if ma60_at_sig > 0 else 0.0
 
-        ma60_limit = -15.0 if sig.signal_type == "B1" else -10.0
-        if ma60_pct < ma60_limit:
-            continue
+        if not strict_mode:
+            ma60_limit = -15.0 if sig.signal_type == "B1" else -10.0
+            if ma60_pct < ma60_limit:
+                continue
 
         # 公共过滤：量比 > 0.5
         if volumes is not None and sig_idx >= 5:
@@ -357,11 +494,13 @@ def _detect_b123(code: str, name: str, cur_price,
             vr_check = float(volumes[sig_idx]) / avg_vol if avg_vol > 0 else 1.0
         else:
             vr_check = 1.0
-        if vr_check <= 0.5:
+        if not strict_mode and vr_check <= 0.5:
             continue
 
         # 评分
-        if sig.signal_type == "B1":
+        if strict_mode:
+            score, extra = _strict_score(sig, strict_context), strict_context
+        elif sig.signal_type == "B1":
             score, extra = _score_b1(sig, segments, closes, volumes, sig_idx)
         elif sig.signal_type == "B2":
             score, extra = _score_b2(sig, segments, closes, volumes, sig_idx)
@@ -373,7 +512,7 @@ def _detect_b123(code: str, name: str, cur_price,
 
         price_chg = round((cur - sig.price) / sig.price * 100, 1) if sig.price > 0 else 0.0
 
-        # 趋势评分（当前状态）
+        # 仅供观察的行情辅助指标；严格模式不据此确认或排序买点。
         trend_score = 0
         if cur > cur_ma20:       trend_score += 30
         if cur_ma20 > cur_ma60:  trend_score += 30
@@ -400,6 +539,7 @@ def _detect_b123(code: str, name: str, cur_price,
             "当前MA60":     round(cur_ma60, 2),
             "MA60偏离%(信号日)": ma60_pct,
             "信号备注":     sig.note,
+            "判定模式":     "严格缠论" if strict_mode else "兼容模式",
             "扫描时间":     datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
         # 合并信号类型专有字段
@@ -414,11 +554,12 @@ def _detect_b123(code: str, name: str, cur_price,
 # ══════════════════════════════════════════════════════════════════════
 
 def scan_b123(sample_size: int = 300,
-              lookback_days: int = 30,
+              lookback_days: int = 5,
               period_days: int = 800,
               target_types: set[str] | None = None,
               min_score: int = 25,
-              workers: int = 1) -> pd.DataFrame:
+              workers: int = 1,
+              strict_mode: bool = True) -> pd.DataFrame:
     """
     扫描全市场，返回满足条件的 B1/B2/B3 信号 DataFrame。
     同一只股票可出现多行（不同信号类型）。
@@ -428,7 +569,8 @@ def scan_b123(sample_size: int = 300,
 
     type_str = "+".join(sorted(target_types))
     print(f"▶ 缠论买点扫描: [{type_str}] | 历史 {period_days} 天 | "
-          f"有效期 {lookback_days} 交易日 | 最低质量分 {min_score}")
+          f"有效期 {lookback_days} 交易日 | 最低质量分 {min_score} | "
+          f"模式 {'严格缠论' if strict_mode else '兼容'}")
 
     uni = get_universe(min_price=3.0, max_price=500.0,
                        min_turnover=0.5, main_board_only=True)
@@ -452,6 +594,7 @@ def scan_b123(sample_size: int = 300,
             lookback_days=lookback_days,
             target_types=target_types,
             min_score=min_score,
+            strict_mode=strict_mode,
         )
         all_records.extend(recs)
         if i % 50 == 0:
@@ -467,10 +610,12 @@ def scan_b123(sample_size: int = 300,
     # 信号类型权重（B3 最稳排前，B2 次之，B1 最后）
     type_rank = {"B3": 0, "B2": 1, "B1": 2}
     df["_type_rank"] = df["信号类型"].map(type_rank).fillna(3)
-    df = df.sort_values(
-        ["_type_rank", "质量分", "趋势评分"],
-        ascending=[True, False, False],
-    ).drop(columns=["_type_rank"])
+    sort_cols = ["_type_rank", "质量分"]
+    ascending = [True, False]
+    if not strict_mode:
+        sort_cols.append("趋势评分")
+        ascending.append(False)
+    df = df.sort_values(sort_cols, ascending=ascending).drop(columns=["_type_rank"])
 
     return df.reset_index(drop=True)
 
@@ -690,7 +835,8 @@ def write_to_sheet(df: pd.DataFrame, spreadsheet_id: str,
 
 def main():
     sample_size = int(os.environ.get("B123_SAMPLE", 300))
-    lookback    = int(os.environ.get("B123_LOOKBACK", 30))
+    strict_mode = os.environ.get("B123_STRICT", "1") != "0"
+    lookback    = int(os.environ.get("B123_LOOKBACK", 5 if strict_mode else 30))
     period_days = int(os.environ.get("B123_DAYS", 800))
     types_str   = os.environ.get("B123_TYPES", "B2,B3")
     min_score   = int(os.environ.get("B123_MIN_SCORE", 25))
@@ -708,6 +854,7 @@ def main():
         target_types=target_types,
         min_score=min_score,
         workers=workers,
+        strict_mode=strict_mode,
     )
 
     if df.empty:

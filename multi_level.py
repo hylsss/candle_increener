@@ -14,7 +14,9 @@ multi_level.py  ── 多级别缠论（日线 / 60分钟 / 30分钟）
         今日 bar 完整、历史 1~2 年，且东财分钟接口挂掉时不受影响。
         日线沿用 _fetch_histories（qfq）。
 
-复用：scan_b123._detect_b123 做各级别的 B1/B2/B3 检测与评分。
+复用：scan_b123._detect_b123 做各周期的严格 B1/B2/B3 检测与评分。
+注意：日/60分/30分是工程上的周期联立，不等同于从最低级别走势递归生成的
+缠论级别；它只作为严格结构信号之外的方向确认，不参与买点定义。
 
 用法：
   python multi_level.py 600732              # 单只多级别诊断
@@ -147,7 +149,7 @@ def analyze_level(code: str, name: str, period: str,
     recs = _detect_b123(
         code=code, name=name, cur_price=out["当前价"], hist=df,
         lookback_days=cfg["lookback"], target_types=target_types,
-        min_score=min_score)
+        min_score=min_score, strict_mode=True)
     out["可用"] = True
     cur = out["当前价"] or 0.0
     sigs = []
