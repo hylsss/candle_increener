@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from concurrent.futures import (
     ThreadPoolExecutor, as_completed,
     TimeoutError as FuturesTimeout,
@@ -48,13 +49,98 @@ import pandas as pd
 
 import local_patch  # noqa: F401
 import akshare as ak
+import requests
 
-from full_scan import get_universe
 from chanlun_core import (
     Direction, TradeSignal,
     from_dataframe, merge_klines, find_fractals, find_strokes,
     find_segments, find_pivots, detect_divergence, find_signals,
 )
+
+
+def _get_ranked_universe(sample_size: int, min_price: float = 3.0,
+                         max_price: float = 500.0,
+                         min_turnover: float = 0.5) -> pd.DataFrame:
+    """从新浪按成交额倒序分页取股票池，并对单页独立重试。
+
+    AKShare ``stock_zh_a_spot`` 会按代码抓取全市场约 70 页，任一页断线都会
+    丢弃全部结果。选股只需要成交额靠前的股票，因此直接请求排序后的前几页。
+    """
+    from akshare.stock.cons import zh_sina_a_stock_payload, zh_sina_a_stock_url
+    from akshare.utils import demjson
+
+    page_size = 80
+    # 主板通常占成交额榜大多数；多取一倍并留至少两页缓冲。
+    max_pages = max(4, (sample_size * 2 + page_size - 1) // page_size)
+    retries = max(1, int(os.environ.get("B123_UNIVERSE_RETRIES", "4")))
+    timeout = float(os.environ.get("CB_HTTP_TIMEOUT", "25"))
+    frames: list[pd.DataFrame] = []
+
+    with requests.Session() as session:
+        for page in range(1, max_pages + 1):
+            payload = zh_sina_a_stock_payload.copy()
+            payload.update({
+                "page": page, "num": page_size,
+                "sort": "amount", "asc": "0",
+            })
+            page_df = None
+            for attempt in range(1, retries + 1):
+                try:
+                    response = session.get(
+                        zh_sina_a_stock_url, params=payload, timeout=timeout)
+                    response.raise_for_status()
+                    data = demjson.decode(response.text)
+                    if not isinstance(data, list):
+                        raise ValueError("新浪行情响应不是列表")
+                    page_df = pd.DataFrame(data)
+                    break
+                except Exception as exc:  # 网络抖动按页重试，不重抓已成功页面
+                    if attempt == retries:
+                        print(f"⚠️  股票池第 {page} 页连续失败 {retries} 次：{exc}")
+                    else:
+                        delay = min(2 ** (attempt - 1), 8)
+                        print(f"   股票池第 {page} 页失败，{delay}s 后重试 "
+                              f"({attempt}/{retries})")
+                        time.sleep(delay)
+            if page_df is None or page_df.empty:
+                continue
+            frames.append(page_df)
+
+            raw = pd.concat(frames, ignore_index=True)
+            codes = raw.get("symbol", pd.Series(dtype=str)).astype(str)
+            names = raw.get("name", pd.Series(dtype=str)).astype(str)
+            main_count = (codes.str.replace(r"^(sh|sz|bj)", "", regex=True)
+                          .str.match(r"^(60[0135]|00[0123])")
+                          & ~names.str.contains("ST", case=False, na=False)).sum()
+            if main_count >= sample_size:
+                break
+
+    if not frames:
+        raise RuntimeError("新浪股票池所有分页请求均失败")
+
+    raw = pd.concat(frames, ignore_index=True).drop_duplicates("symbol")
+    required = {"symbol", "name", "trade", "amount"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"新浪行情字段缺失：{', '.join(sorted(missing))}")
+
+    result = pd.DataFrame({
+        "代码": raw["symbol"].astype(str).str.replace(
+            r"^(sh|sz|bj)", "", regex=True),
+        "名称": raw["name"].astype(str),
+        "当前价": pd.to_numeric(raw["trade"], errors="coerce"),
+        "成交额_亿元": pd.to_numeric(raw["amount"], errors="coerce") / 100_000_000,
+    })
+    mask = (
+        result["当前价"].between(min_price, max_price)
+        & (result["成交额_亿元"] >= min_turnover)
+        & ~result["名称"].str.contains("ST", case=False, na=False)
+        & result["代码"].str.match(r"^(60[0135]|00[0123])")
+    )
+    return (result.loc[mask]
+            .sort_values("成交额_亿元", ascending=False)
+            .head(sample_size)
+            .reset_index(drop=True))
 
 
 def _pivot_end_idx(pivot) -> int:
@@ -572,9 +658,8 @@ def scan_b123(sample_size: int = 300,
           f"有效期 {lookback_days} 交易日 | 最低质量分 {min_score} | "
           f"模式 {'严格缠论' if strict_mode else '兼容'}")
 
-    uni = get_universe(min_price=3.0, max_price=500.0,
-                       min_turnover=0.5, main_board_only=True)
-    uni = uni.sort_values("成交额_亿元", ascending=False).head(sample_size)
+    uni = _get_ranked_universe(
+        sample_size, min_price=3.0, max_price=500.0, min_turnover=0.5)
     name_map = dict(zip(uni["代码"].astype(str), uni["名称"].astype(str)))
     price_map = dict(zip(uni["代码"].astype(str), uni["当前价"]))
     codes = list(uni["代码"].astype(str))
